@@ -1,0 +1,8 @@
+# myMemory 运行依赖 —— 版本锁死。
+# 理由见 docs/adr/0011-pinned-deps-both-platforms.md：
+# mcp 2.x 已将 FastMCP 更名为 MCPServer，浮动版本号会让服务在某次
+# pip install 后静默失效。
+mcp==2.1.1
+uvicorn==0.52.4
+jieba==0.42.1
+rank-bm25==0.2.2

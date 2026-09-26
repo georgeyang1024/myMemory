@@ -1,0 +1,294 @@
+﻿"""config.py：人工管理 source 与刷新周期。
+
+校验失败时必须**一个字节都不改**：配置文件写坏了，服务下次就起不来。
+"""
+
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+MCP_DIR = Path(__file__).resolve().parents[1]
+
+
+def load_cli_module():
+    spec = importlib.util.spec_from_file_location("config_cli", MCP_DIR / "config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+config_cli = load_cli_module()
+
+
+@pytest.fixture
+def env(tmp_path: Path, monkeypatch):
+    for name in ("memory", "team", "company", "other"):
+        (tmp_path / name).mkdir()
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "poll_interval": 600,
+        "sources": [{"name": "memory", "dir": str(tmp_path / "memory"), "writable": True}],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("MEMORY_CONFIG", str(config))
+    return tmp_path, config
+
+
+def data(config: Path) -> dict:
+    return json.loads(config.read_text(encoding="utf-8"))
+
+
+def names(config: Path) -> list[str]:
+    return [w["name"] for w in data(config)["sources"]]
+
+
+def test_add_source(env, capsys):
+    root, config = env
+    assert config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--writable",
+                        "--desc", "团队"]) == 0
+    item = data(config)["sources"][1]
+    assert item == {"name": "team", "dir": os.path.abspath(root / "team"), "writable": True,
+                    "description": "团队"}
+    assert "重启后生效" in capsys.readouterr().out
+
+
+def test_add_creates_config_from_scratch(tmp_path, monkeypatch, capsys):
+    """配置不存在时 source add 从零建档；memory 走共享入口、描述默认"默认记忆源"（ADR-0025）。"""
+    root = tmp_path / "mem"
+    root.mkdir()
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("MEMORY_CONFIG", str(config))
+    assert config_cli.main(["source", "add", "memory", "--dir", str(root), "--writable"]) == 0
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["port"] == 7083 and saved["poll_interval"] == 600, "默认值随建档写入"
+    assert saved["sources"] == [
+        {"name": "memory", "dir": os.path.abspath(root), "writable": True,
+         "description": "默认记忆源"}]
+    assert "将创建" in capsys.readouterr().out
+
+    # 其它名字也允许从零建档，但不带默认描述
+    other = tmp_path / "mem2"
+    other.mkdir()
+    config2 = tmp_path / "config2.json"
+    monkeypatch.setenv("MEMORY_CONFIG", str(config2))
+    assert config_cli.main(["source", "add", "team", "--dir", str(other), "--readonly"]) == 0
+    saved2 = json.loads(config2.read_text(encoding="utf-8"))
+    assert saved2["sources"] == [{"name": "team", "dir": os.path.abspath(other),
+                                  "writable": False}]
+
+
+def test_missing_config_blocks_other_commands(tmp_path, monkeypatch, capsys):
+    """除 source add / list 外，配置不存在时其余子命令直接报错，不隐式创建。"""
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("MEMORY_CONFIG", str(config))
+    assert config_cli.main(["source", "list"]) == 0, "list 只提示，不算错误"
+    capsys.readouterr()
+    for argv in (["source", "edit", "x", "--desc", "y"],
+                 ["config", "set", "poll_interval", "60"]):
+        assert config_cli.main(argv) == 2
+        assert "配置文件不存在" in capsys.readouterr().err
+    assert not config.exists(), "不得隐式创建配置文件"
+
+
+def test_add_readonly_sets_writable_false(env):
+    root, config = env
+    assert config_cli.main(["source", "add", "company", "--dir", str(root / "company"), "--readonly"]) == 0
+    assert names(config) == ["memory", "company"], "只读不再改名"
+    assert data(config)["sources"][1]["writable"] is False
+
+
+def test_add_requires_readonly_or_writable(env):
+    root, config = env
+    before = config.read_bytes()
+    with pytest.raises(SystemExit):
+        config_cli.main(["source", "add", "team", "--dir", str(root / "team")])  # 没指定只读/可写
+    with pytest.raises(SystemExit):
+        config_cli.main(["source", "add", "team", str(root / "team"), "--writable"])  # 目录必须写 --dir
+    with pytest.raises(SystemExit):
+        config_cli.main(["source", "add", "team", "--writable"])  # 缺 --dir
+    with pytest.raises(SystemExit):
+        config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--readonly", "--writable"])
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize("argv", [
+    ["source", "add", "bad/name", "--dir", "{root}/team", "--writable"],
+    ["source", "add", "readonly/team", "--dir", "{root}/team", "--readonly"],   # 旧的前缀写法
+    ["source", "add", "memory", "--dir", "{root}/team", "--writable"],          # 重名
+    ["source", "add", "team", "--dir", "{root}/nope", "--writable"],            # 目录不存在
+    ["source", "add", "team", "--dir", "{root}/memory", "--writable"],          # 重叠
+    ["source", "add", "team", "--dir", "{root}/memory/sub", "--writable"],      # 嵌套（目录存在）
+    ["source", "edit", "nope", "--desc", "x"],
+    ["source", "edit", "memory", "--name", "a/b"],
+    ["source", "remove", "nope", "--yes"],
+    ["config", "set", "poll_interval", "-1"],
+    ["config", "set", "poll_interval", "abc"],
+])
+def test_invalid_operations_leave_config_untouched(env, argv, capsys):
+    root, config = env
+    (root / "memory" / "sub").mkdir()
+    before = config.read_bytes()
+    argv = [a.replace("{root}", str(root)) for a in argv]
+    assert config_cli.main(argv) == 2
+    assert config.read_bytes() == before, "校验失败不得修改配置文件"
+    assert "错误" in capsys.readouterr().err
+
+
+def test_edit_toggles_readonly_without_renaming(env):
+    root, config = env
+    config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--writable"])
+    assert config_cli.main(["source", "edit", "team", "--readonly"]) == 0
+    assert names(config) == ["memory", "team"]
+    assert data(config)["sources"][1]["writable"] is False
+    assert config_cli.main(["source", "edit", "team", "--writable"]) == 0
+    assert data(config)["sources"][1]["writable"] is True
+    with pytest.raises(SystemExit):
+        config_cli.main(["source", "edit", "team", "--readonly", "--writable"])
+
+
+def test_edit_rename_keeps_readonly(env):
+    root, config = env
+    config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--readonly"])
+    assert config_cli.main(["source", "edit", "team", "--name", "team2"]) == 0
+    assert data(config)["sources"][1] == {"name": "team2", "dir": os.path.abspath(root / "team"),
+                                             "writable": False}
+
+
+def test_source_offline_elsewhere_does_not_block_editing(env):
+    """另一个 source 的目录不在（如掉盘）时，仍可修改配置——只校验本次涉及的目录。"""
+    root, config = env
+    cfg = data(config)
+    cfg["sources"].append({"name": "gone", "dir": str(root / "gone"), "writable": False})
+    config.write_text(json.dumps(cfg), encoding="utf-8")
+    assert config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--writable"]) == 0
+
+
+def test_edit_dir_and_desc(env):
+    root, config = env
+    assert config_cli.main(["source", "edit", "memory", "--dir", str(root / "other"),
+                        "--desc", "新描述"]) == 0
+    item = data(config)["sources"][0]
+    assert item["dir"] == os.path.abspath(root / "other") and item["description"] == "新描述"
+    assert config_cli.main(["source", "edit", "memory", "--desc", ""]) == 0
+    assert "description" not in data(config)["sources"][0]
+
+
+def test_edit_without_changes_is_rejected(env):
+    assert config_cli.main(["source", "edit", "memory"]) == 2
+
+
+def test_remove_only_touches_config(env):
+    root, config = env
+    config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--writable"])
+    (root / "team" / "保留.md").write_text("文件不删", encoding="utf-8")
+    assert config_cli.main(["source", "remove", "team", "--yes"]) == 0
+    assert names(config) == ["memory"]
+    assert (root / "team" / "保留.md").exists(), "remove 只删配置，不删磁盘文件"
+
+
+def test_remove_asks_for_confirmation(env, monkeypatch):
+    root, config = env
+    config_cli.main(["source", "add", "team", "--dir", str(root / "team"), "--writable"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    assert config_cli.main(["source", "remove", "team"]) == 1
+    assert names(config) == ["memory", "team"]
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    assert config_cli.main(["source", "remove", "team"]) == 0
+    assert names(config) == ["memory"]
+
+
+def test_cannot_remove_last_source(env):
+    _, config = env
+    before = config.read_bytes()
+    assert config_cli.main(["source", "remove", "memory", "--yes"]) == 2
+    assert config.read_bytes() == before
+
+
+def test_set_poll_interval(env):
+    _, config = env
+    assert config_cli.main(["config", "set", "poll_interval", "60"]) == 0
+    assert data(config)["poll_interval"] == 60
+
+
+def test_only_poll_interval_is_settable(env):
+    with pytest.raises(SystemExit):
+        config_cli.main(["config", "set", "port", "8080"])
+
+
+def test_list(env, capsys):
+    root, _ = env
+    config_cli.main(["source", "add", "company", "--dir", str(root / "company"), "--readonly", "--desc", "制度"])
+    capsys.readouterr()
+    assert config_cli.main(["source", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "memory" in out and "读写" in out
+    assert "company" in out and "只读" in out and "制度" in out
+
+
+def test_restart_flag_calls_run_py(env, monkeypatch):
+    root, config = env
+    calls = []
+    monkeypatch.setattr(config_cli.subprocess, "run",
+                        lambda cmd, env: calls.append((cmd, env)) or type("R", (), {"returncode": 0})())
+    assert config_cli.main(["config", "set", "poll_interval", "60", "--restart"]) == 0
+    cmd, environ = calls[0]
+    assert cmd == [sys.executable, str(MCP_DIR / "run.py"), "--restart"]
+    assert environ["MEMORY_CONFIG"] == str(config.resolve())
+
+
+def test_restart_command(env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(config_cli.subprocess, "run",
+                        lambda cmd, env: calls.append(cmd) or type("R", (), {"returncode": 0})())
+    assert config_cli.main(["restart"]) == 0
+    assert calls[0][-1] == "--restart"
+
+
+def test_reindex_when_service_down(env, capsys):
+    _, config = env
+    cfg = data(config)
+    cfg["port"] = 1  # 没有服务监听
+    config.write_text(json.dumps(cfg), encoding="utf-8")
+    assert config_cli.main(["reindex"]) == 1
+    assert "服务未运行" in capsys.readouterr().out
+
+
+def test_reindex_posts_to_running_service(env, monkeypatch, capsys):
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"index_refresh": "started"}'
+
+    def fake_urlopen(request, timeout):
+        seen["url"], seen["method"] = request.full_url, request.get_method()
+        return FakeResponse()
+
+    monkeypatch.setattr(config_cli.urllib.request, "urlopen", fake_urlopen)
+    assert config_cli.main(["reindex"]) == 0
+    assert seen == {"url": "http://127.0.0.1:7083/reindex", "method": "POST"}
+    assert "增量" in capsys.readouterr().out
+
+    assert config_cli.main(["reindex", "--full"]) == 0
+    assert seen["url"] == "http://127.0.0.1:7083/reindex?full=1"
+    assert "全量" in capsys.readouterr().out
+
+
+def test_set_max_cached_docs(env, capsys):
+    _, config = env
+    assert config_cli.main(["config", "set", "max_cached_docs", "500"]) == 0
+    assert data(config)["max_cached_docs"] == 500
+    assert config_cli.main(["config", "set", "max_cached_docs", "0"]) == 0
+    assert "不限" in capsys.readouterr().out
+    before = config.read_bytes()
+    assert config_cli.main(["config", "set", "max_cached_docs", "-1"]) == 2
+    assert config.read_bytes() == before

@@ -1,0 +1,16 @@
+# 虚拟环境（只在当前系统运行，见 docs/adr/0021-single-platform.md）
+.venv/
+__pycache__/
+*.pyc
+# 运行数据默认在 ~/.myMemory/（config.json、index.cache、logs/），不在代码目录。
+# 以下几行只防止有人用 MEMORY_CONFIG 把它们指回仓库里。
+config.json
+index.cache
+.pytest_cache/
+logs/
+# CodeGraph 本地索引（其内部 .gitignore 已忽略库文件，这里兜底）
+.codegraph/
+# 会话与 IDE 本地文件
+.claude/
+.idea/
+.vscode/
