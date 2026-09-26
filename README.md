@@ -1,5 +1,8 @@
 # myMemory
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 **A local-first memory service for humans and AI agents.**
 人与 AI 共同使用的本机记忆库：双方都往里写、都从里读，跨会话长期保存。
 
@@ -8,6 +11,21 @@
 记忆就是普通的 Markdown / 文本文件，放在你自己指定的目录里——没有数据库、
 没有云端、没有锁定。AI 通过 MCP 工具检索与写入；你随时用编辑器直接增删改，
 改动照常进索引。
+
+---
+
+## English overview
+
+**myMemory** is a local-first, self-hosted **long-term memory server for AI agents and humans**. Plain Markdown files are the single source of truth — no vector database, no cloud dependency, no lock-in. Agents read and write through [MCP (Model Context Protocol)](https://modelcontextprotocol.io) tools; you edit the same notes in any editor at any time, and your changes enter the search index automatically.
+
+- **Full-text retrieval with BM25** keyword ranking + jieba tokenization — deterministic, explainable, fully offline
+- Multiple named *sources* (personal / team / company), each a directory on local disk or a mounted volume (NAS) → one shared memory across people and devices
+- Returns **evidence snippets with provenance** (source + path), not pre-baked answers
+- Fast start via persistent index cache; keeps serving when the mount is briefly offline
+
+Use cases: personal AI note-taking, team knowledge bases that agents can query, lightweight local search over your own documents.
+
+---
 
 ## 特点
 
