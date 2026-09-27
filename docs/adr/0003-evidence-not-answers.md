@@ -4,9 +4,9 @@
 
 ## 背景
 
-同团队已有的 `mobileKnowledgeBase`（`http://192.168.4.234:7081/mcp`）提供
+同团队已有的一个知识库服务（`http://<内网服务器>:<端口>/mcp`）提供
 `kb_query(mode=cross_ai)`：服务端起异步 job 调用 LLM 生成答案，配套
-`kb_answer_status` 轮询。是否照搬该形态需要决策。
+状态轮询。是否照搬该形态需要决策。
 
 ## 决策
 

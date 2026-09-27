@@ -1,4 +1,4 @@
-﻿"""传输层安全：Host 校验必须反映真实绑定地址，而不是 SDK 的默认值。
+"""传输层安全：Host 校验必须反映真实绑定地址，而不是 SDK 的默认值。
 
 本服务不做 Host 白名单——它面向受信任的局域网且免鉴权，白名单不解决任何
 实际威胁，只会误伤。但"不做"不是省略参数就能表达的：
@@ -21,7 +21,7 @@ from test_corpus import make_config
 def corpus(tmp_path: Path):
     raw = tmp_path / "memory"
     raw.mkdir(parents=True)
-    (raw / "note.md").write_text("LESC 配对说明。", encoding="utf-8")
+    (raw / "note.md").write_text("SecProto 机制说明。", encoding="utf-8")
     return tmp_path
 
 

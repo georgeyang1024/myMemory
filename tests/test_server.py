@@ -1,4 +1,4 @@
-﻿"""server 层单测：入参钳制、安全边界、分页、响应结构。"""
+"""server 层单测：入参钳制、安全边界、分页、响应结构。"""
 
 from pathlib import Path
 
@@ -12,10 +12,10 @@ from test_corpus import make_config
 
 @pytest.fixture
 def env(tmp_path: Path):
-    raw = tmp_path / "memory" / "Company_Facts_And_Status"
+    raw = tmp_path / "memory" / "Facts_And_Status"
     raw.mkdir(parents=True)
-    (raw / "固件指令集.md").write_text("震动控制 Vibrate:x; 马达以x档开始震动。" * 200, encoding="utf-8")
-    (raw / "蓝牙产品现状.md").write_text("当前芯片与 App 兼容性现状。" * 50, encoding="utf-8")
+    (raw / "规格汇总.md").write_text("字段控制 Field:x; 单元以x档开始运转。" * 200, encoding="utf-8")
+    (raw / "项目背景.md").write_text("当前模块与调用方的适配说明。" * 50, encoding="utf-8")
     config = make_config(tmp_path)
     return config, index.build(config)
 
@@ -24,7 +24,7 @@ def env(tmp_path: Path):
 
 def test_search_response_shape(env):
     config, snapshot = env
-    payload = run_search(config, snapshot, "震动控制", 3)
+    payload = run_search(config, snapshot, "字段控制", 3)
     assert set(payload) == {"index", "query", "source", "total_matched", "returned", "results"}
     assert set(payload["index"]) == {"built_at", "doc_count", "chunk_count"}
     for result in payload["results"]:
@@ -36,7 +36,7 @@ def test_search_response_shape(env):
 
 def test_search_index_meta_carries_freshness(env):
     config, snapshot = env
-    payload = run_search(config, snapshot, "震动", 1)
+    payload = run_search(config, snapshot, "字段", 1)
     assert payload["index"]["doc_count"] == snapshot.doc_count
     assert payload["index"]["built_at"] == snapshot.built_at.isoformat(timespec="seconds")
 
@@ -49,21 +49,21 @@ def test_search_empty_query_is_rejected(env):
 
 def test_search_limit_is_clamped_not_rejected(env):
     config, snapshot = env
-    assert len(run_search(config, snapshot, "震动", 999_999)["results"]) <= config.max_results
-    assert len(run_search(config, snapshot, "震动", -5)["results"]) >= 1
-    assert len(run_search(config, snapshot, "震动", "abc")["results"]) <= config.default_results
+    assert len(run_search(config, snapshot, "字段", 999_999)["results"]) <= config.max_results
+    assert len(run_search(config, snapshot, "字段", -5)["results"]) >= 1
+    assert len(run_search(config, snapshot, "字段", "abc")["results"]) <= config.default_results
 
 
 def test_search_query_is_truncated_not_rejected(env):
     config, snapshot = env
-    payload = run_search(config, snapshot, "震动" * 1000, 3)
+    payload = run_search(config, snapshot, "字段" * 1000, 3)
     assert len(payload["query"]) == config.max_query_chars
 
 
 def test_snippet_is_truncated_and_flagged(env):
     config, snapshot = env
     small = make_config(config.config_file.parent, MEMORY_SNIPPET_CHARS="100")
-    payload = run_search(small, snapshot, "震动控制", 1)
+    payload = run_search(small, snapshot, "字段控制", 1)
     result = payload["results"][0]
     assert len(result["snippet"]) == 100
     assert result["snippet_truncated"] is True
@@ -76,11 +76,11 @@ def test_snippet_is_truncated_and_flagged(env):
     [
         "../../etc/passwd",
         "/etc/passwd",
-        "../raw/Company_Facts_And_Status/固件指令集.md",
-        "Company_Facts_And_Status/../Company_Facts_And_Status/固件指令集.md",
+        "../raw/Facts_And_Status/规格汇总.md",
+        "Facts_And_Status/../Facts_And_Status/规格汇总.md",
         "wiki/index.md",
         "../src/config.py",
-        "Company_Facts_And_Status/固件指令集.MD",
+        "Facts_And_Status/规格汇总.MD",
         "",
         "   ",
     ],
@@ -94,14 +94,14 @@ def test_get_document_rejects_non_indexed_paths(env, attack):
 
 def test_get_document_rejection_offers_suggestions(env):
     config, snapshot = env
-    payload = run_get_document(config, snapshot, "memory", "固件指令集.md", 0, 1000)
+    payload = run_get_document(config, snapshot, "memory", "规格汇总.md", 0, 1000)
     assert payload["suggestions"], "拒绝时应给出相近路径，避免 LLM 盲目重试"
-    assert any("固件指令集" in s["path"] and s["source"] == "memory" for s in payload["suggestions"])
+    assert any("规格汇总" in s["path"] and s["source"] == "memory" for s in payload["suggestions"])
 
 
 def test_get_document_accepts_indexed_path(env):
     config, snapshot = env
-    path = "Company_Facts_And_Status/固件指令集.md"
+    path = "Facts_And_Status/规格汇总.md"
     payload = run_get_document(config, snapshot, "memory", path, 0, 40_000)
     assert payload["source"] == "memory" and payload["path"] == path
     assert payload["content"] == snapshot.contents[("memory", path)][: payload["returned_chars"]]
@@ -112,7 +112,7 @@ def test_get_document_accepts_indexed_path(env):
 
 def test_get_document_paginates(env):
     config, snapshot = env
-    path = "Company_Facts_And_Status/固件指令集.md"
+    path = "Facts_And_Status/规格汇总.md"
     first = run_get_document(config, snapshot, "memory", path, 0, 100)
     assert first["returned_chars"] == 100
     assert first["has_more"] is True
@@ -125,7 +125,7 @@ def test_get_document_paginates(env):
 
 def test_get_document_last_page_reports_no_more(env):
     config, snapshot = env
-    path = "Company_Facts_And_Status/蓝牙产品现状.md"
+    path = "Facts_And_Status/项目背景.md"
     payload = run_get_document(config, snapshot, "memory", path, 0, 40_000)
     assert payload["has_more"] is False
     assert payload["next_offset"] is None
@@ -133,14 +133,14 @@ def test_get_document_last_page_reports_no_more(env):
 
 def test_get_document_limit_is_clamped(env):
     config, snapshot = env
-    path = "Company_Facts_And_Status/固件指令集.md"
+    path = "Facts_And_Status/规格汇总.md"
     payload = run_get_document(config, snapshot, "memory", path, 0, 999_999)
     assert payload["returned_chars"] <= config.max_doc_chars
 
 
 def test_get_document_offset_beyond_end_returns_empty(env):
     config, snapshot = env
-    path = "Company_Facts_And_Status/蓝牙产品现状.md"
+    path = "Facts_And_Status/项目背景.md"
     total = len(snapshot.contents[("memory", path)])
     payload = run_get_document(config, snapshot, "memory", path, total, 100)
     assert payload["returned_chars"] == 0
@@ -152,8 +152,8 @@ def test_get_document_offset_beyond_end_returns_empty(env):
 def test_get_document_requires_matching_source(env):
     """同一个 path 换一个 source 名就不是同一篇——身份是 (source, path)。"""
     config, snapshot = env
-    path = "Company_Facts_And_Status/固件指令集.md"
-    for source in ("", "   ", "team", "memory/Company_Facts_And_Status", "Memory"):
+    path = "Facts_And_Status/规格汇总.md"
+    for source in ("", "   ", "team", "memory/Facts_And_Status", "Memory"):
         payload = run_get_document(config, snapshot, source, path, 0, 100)
         assert "error" in payload and "content" not in payload, source
 
@@ -161,19 +161,19 @@ def test_get_document_requires_matching_source(env):
 def test_get_document_rejects_source_glued_into_path(env):
     config, snapshot = env
     payload = run_get_document(config, snapshot, "memory",
-                               "memory/Company_Facts_And_Status/固件指令集.md", 0, 100)
+                               "memory/Facts_And_Status/规格汇总.md", 0, 100)
     assert "error" in payload
 
 
 def test_search_unknown_source_returns_error_with_names(env):
     config, snapshot = env
-    payload = run_search(config, snapshot, "震动", 3, "不存在")
+    payload = run_search(config, snapshot, "字段", 3, "不存在")
     assert payload["error"] and payload["sources"] == ["memory"]
 
 
 def test_search_scoped_to_source(env):
     config, snapshot = env
-    payload = run_search(config, snapshot, "震动", 3, "memory")
+    payload = run_search(config, snapshot, "字段", 3, "memory")
     assert payload["source"] == "memory"
     assert payload["results"] and all(r["source"] == "memory" for r in payload["results"])
 
@@ -186,7 +186,7 @@ def test_health_carries_index_config_and_sources(env):
     body = run_health(config, snapshot)
 
     assert body["status"] == "ok"
-    assert body["version"] == "0.1.0"
+    assert body["version"] == "0.2.0"
     assert body["doc_count"] == snapshot.doc_count
     assert body["config_file"] == str(config.config_file)
     assert body["sources"] == [
@@ -214,12 +214,12 @@ from storage import DISK_OFFLINE, Availability  # noqa: E402
 
 @pytest.fixture
 def multi(tmp_path: Path):
-    for name in ("memory", "team", "company"):
+    for name in ("memory", "team", "org"):
         (tmp_path / name).mkdir()
     config = make_config(tmp_path, sources=[
         {"name": "memory", "dir": str(tmp_path / "memory"), "description": "个人"},
         {"name": "team", "dir": str(tmp_path / "team")},
-        {"name": "company", "dir": str(tmp_path / "company"), "writable": False, "description": "制度"},
+        {"name": "org", "dir": str(tmp_path / "org"), "writable": False, "description": "制度"},
     ])
     return config
 
@@ -239,14 +239,14 @@ def _settle(holder):
 
 
 def test_list_sources_reports_writability_without_dirs(multi):
-    _touch(multi.source("company").dir / "制度.md", "报销", 1_000_000)
+    _touch(multi.source("org").dir / "制度.md", "报销", 1_000_000)
     body = run_list_sources(multi, index.build(multi))
     assert body["sources"] == [
         {"name": "memory", "writable": True, "available": True, "unavailable_reason": None,
          "doc_count": 0, "description": "个人"},
         {"name": "team", "writable": True, "available": True, "unavailable_reason": None,
          "doc_count": 0, "description": ""},
-        {"name": "company", "writable": False, "available": True, "unavailable_reason": None,
+        {"name": "org", "writable": False, "available": True, "unavailable_reason": None,
          "doc_count": 1, "description": "制度"},
     ]
     assert str(multi.source("memory").dir) not in str(body), "不得暴露目录绝对路径"
@@ -254,14 +254,14 @@ def test_list_sources_reports_writability_without_dirs(multi):
 
 def test_writable_flag_on_every_document_output(multi):
     """search / recent / get-document 每条都带 writable，只读 source 为 false。"""
-    _touch(multi.source("team").dir / "a.md", "LESC 团队", 1_700_000_000)
-    _touch(multi.source("company").dir / "b.md", "LESC 公司", 1_700_000_001)
+    _touch(multi.source("team").dir / "a.md", "SecProto 团队", 1_700_000_000)
+    _touch(multi.source("org").dir / "b.md", "SecProto 制度", 1_700_000_001)
     snapshot = index.build(multi)
-    by_ws = {r["source"]: r["writable"] for r in run_search(multi, snapshot, "LESC", 5)["results"]}
-    assert by_ws == {"team": True, "company": False}
+    by_ws = {r["source"]: r["writable"] for r in run_search(multi, snapshot, "SecProto", 5)["results"]}
+    assert by_ws == {"team": True, "org": False}
     by_ws = {r["source"]: r["writable"] for r in run_recent(multi, snapshot, 10)["results"]}
-    assert by_ws == {"team": True, "company": False}
-    assert run_get_document(multi, snapshot, "company", "b.md", 0, 100)["writable"] is False
+    assert by_ws == {"team": True, "org": False}
+    assert run_get_document(multi, snapshot, "org", "b.md", 0, 100)["writable"] is False
     assert run_get_document(multi, snapshot, "team", "a.md", 0, 100)["writable"] is True
 
 
@@ -269,7 +269,7 @@ def test_offline_source_is_stale_and_not_writable(multi, monkeypatch):
     """掉盘：内容仍可检索与读取（stale），但 writable 为 false、available 为 false。"""
     import storage
 
-    _touch(multi.source("team").dir / "a.md", "LESC 团队", 1_700_000_000)
+    _touch(multi.source("team").dir / "a.md", "SecProto 团队", 1_700_000_000)
     holder = index.IndexHolder(multi)
     holder.build_now()
     monkeypatch.setattr(storage.LocalStorage, "probe",
@@ -279,9 +279,9 @@ def test_offline_source_is_stale_and_not_writable(multi, monkeypatch):
     snapshot = _settle(holder)
 
     doc = run_get_document(multi, snapshot, "team", "a.md", 0, 100)
-    assert doc["content"].startswith("LESC 团队") and doc["stale"] is True and doc["writable"] is False
+    assert doc["content"].startswith("SecProto 团队") and doc["stale"] is True and doc["writable"] is False
     assert run_get_document(multi, snapshot, "memory", "x", 0, 1).get("stale") is None  # 被拒绝的路径
-    hit = run_search(multi, snapshot, "LESC", 5)["results"][0]
+    hit = run_search(multi, snapshot, "SecProto", 5)["results"][0]
     assert hit["source"] == "team" and hit["writable"] is False
     team = next(w for w in run_list_sources(multi, snapshot)["sources"] if w["name"] == "team")
     assert team["available"] is False and team["unavailable_reason"] == DISK_OFFLINE

@@ -67,6 +67,10 @@ DEFAULTS: dict[str, Any] = {
     # 分词时保持为一个词，且长字母数字串会额外发出其包含的术语，
     # 让"用系列名检索完整型号"命中。改动会作废索引缓存。
     "domain_terms": [],
+    # AI 能否删除记忆（delete 工具，以及 merge 并入后删除源文件）。
+    # 默认 False：删除不可备份不可恢复，关闭时这两个工具对 AI 彻底隐藏，
+    # 要开启需人工改配置并重启——这是心智上的断路器，不是运行时开关。
+    "allow_mcp_delete": False,
 }
 
 # 字段 -> (最小值, 最大值)
@@ -324,6 +328,7 @@ class Config:
     max_cached_docs: int = field(default=1000)
     max_query_chars: int = field(default=500)
     domain_terms: tuple[str, ...] = field(default=())
+    allow_mcp_delete: bool = field(default=False)
 
     @classmethod
     def load(cls, path: Path | None = None, *, create_default: bool = True) -> "Config":
@@ -372,6 +377,10 @@ class Config:
         if not isinstance(host, str) or not host.strip():
             raise ConfigError("host 必须是非空字符串")
 
+        allow_mcp_delete = data.get("allow_mcp_delete", DEFAULTS["allow_mcp_delete"])
+        if not isinstance(allow_mcp_delete, bool):
+            raise ConfigError("allow_mcp_delete 必须是 true 或 false")
+
         chunk_size = _int_field(data, "chunk_size")
         chunk_overlap = _int_field(data, "chunk_overlap")
         if chunk_overlap >= chunk_size:
@@ -395,6 +404,7 @@ class Config:
             max_create_chars=_int_field(data, "max_create_chars"),
             max_cached_docs=_int_field(data, "max_cached_docs"),
             domain_terms=domain_terms,
+            allow_mcp_delete=allow_mcp_delete,
         )
 
     @staticmethod
@@ -439,4 +449,5 @@ class Config:
             "chunk_overlap": self.chunk_overlap,
             "max_cached_docs": self.max_cached_docs,
             "domain_terms": len(self.domain_terms),
+            "allow_mcp_delete": self.allow_mcp_delete,
         }

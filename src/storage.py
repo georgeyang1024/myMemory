@@ -54,6 +54,8 @@ class Storage(Protocol):
     def read_text(self, path: str) -> str: ...
     def stat(self, path: str) -> FileStat | None: ...
     def write_text(self, path: str, text: str) -> FileStat: ...
+    def move(self, old_path: str, new_path: str) -> FileStat: ...
+    def remove(self, path: str) -> None: ...
 
 
 def _is_hidden(relative: PurePosixPath) -> bool:
@@ -182,6 +184,31 @@ class LocalStorage:
         absolute.write_text(text, encoding="utf-8", newline="\n")
         st = absolute.stat()
         return FileStat(path=path, mtime=st.st_mtime, size=st.st_size)
+
+    def move(self, old_path: str, new_path: str) -> FileStat:
+        """把 source 目录内的一个文件挪到另一处并返回新位置的状态。
+
+        与 write_text 同一套闸（只读拒、目录不存在拒）；先建目标所在目录、
+        再改名，失败时不会留下半移动的状态（改名本身是原子的）。
+        """
+        if not self.source.can_write:
+            raise PermissionError(f"source {self.source.name} 为只读")
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"source {self.source.name} 的目录不存在：{self.root}")
+        source_absolute = self._absolute(old_path)
+        target_absolute = self._absolute(new_path)
+        target_absolute.parent.mkdir(parents=True, exist_ok=True)
+        source_absolute.rename(target_absolute)
+        st = target_absolute.stat()
+        return FileStat(path=new_path, mtime=st.st_mtime, size=st.st_size)
+
+    def remove(self, path: str) -> None:
+        """删除 source 目录内的一个文件，与 write_text 同一套前置闸。"""
+        if not self.source.can_write:
+            raise PermissionError(f"source {self.source.name} 为只读")
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"source {self.source.name} 的目录不存在：{self.root}")
+        self._absolute(path).unlink(missing_ok=True)
 
 
 def open_storage(source: Source) -> Storage:

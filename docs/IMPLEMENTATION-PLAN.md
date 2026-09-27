@@ -1,8 +1,9 @@
 # myMemory — 实施计划（首版建设记录）
 
 > ⚠️ **这是历史记录**：本文是 2026-09-02 建设本项目前身（一个团队技术知识库）
-> 时的实施计划，其中的语料规模、实测数字与"目标语料 `raw/`"等描述**刻意未改写**——
+> 时的实施计划，其中的语料规模、实测数字保留——
 > 它记的是当时按什么证据、分几步做的。检索引擎本身自那时起没有重写。
+> 具体的业务词汇与路径已重写为同结构的虚构示例。
 > 0.1.0（多 workspace、config.json）的实施清单见 [TASKS.md](TASKS.md)；
 > 文中的 `.env` 与 `MEMORY_*` 环境变量已作废。
 > 2026-09-17 改造为个人记忆库（改名 + 新增写入）的设计见
@@ -27,7 +28,7 @@
 | PyPI 可达 | ✅ 已实测（`mcp 2.1.1` 可下载安装） |
 | SDK API 形态 | ✅ 已实测确认（`MCPServer`，非 `FastMCP`） |
 | 性能基线 | ✅ 已实测（冷启动 2.2 s / 查询 2 ms） |
-| 目标语料 | ✅ 已确定（`raw/` 下 265 个 md/txt） |
+| 目标语料 | ✅ 已确定（语料目录下 265 个 md/txt） |
 
 ## 0.1 执行结果摘要
 
@@ -123,9 +124,9 @@ mcp/
 - [ ] 单测：切块边界（空文件、短于窗口的文件、恰好整除窗口的文件）
 - [ ] 单测：`indexed_paths` 与 `documents` 的键集合完全一致
 - [ ] 单测：`fingerprint` 能检测到「新增文件」「修改文件」「删除文件」三种变更
-- [ ] 集成：对真实 `raw/` 构建，断言 `doc_count == 265`、`chunk_count == 3106`
+- [ ] 集成：对真实语料构建，断言 `doc_count == 265`、`chunk_count == 3106`
 - [ ] 集成：冷启动耗时 < 4 s（基线 2.2 s，留 1.7 s 余量）
-- [ ] 集成：检索 `固件指令集`，top-1 命中 `raw/Company_Facts_And_Status/固件指令集.md`
+- [ ] 集成：检索 `规格汇总`，top-1 命中 `raw/Facts_And_Status/规格汇总.md`
 - [ ] 集成：临时改动一个 raw 文件的 mtime，确认轮询线程在一个周期内重建且 `built_at` 更新
 - [ ] 集成：让 `build()` 抛异常，确认旧快照仍在服务、日志有 ERROR
 
@@ -138,8 +139,8 @@ mcp/
 **任务**
 
 1. `MCPServer(name="myMemory", version=...)`，`instructions` 中写明知识库范围
-   （"dx-ble-toy-security 项目的 raw/ 事实源层：BLE 玩具安全方案的会议纪要、
-   方案设计稿、公司现状、技术资料与交付规格"）
+   （"内部项目的 raw/ 事实源层：项目记录、
+    方案设计稿、背景资料、技术资料与交付规格"）
 2. `@server.tool(name="myMemory-search")`
    - description 必须包含：语料范围、返回是证据片段而非答案、
      **以及"先读 `raw/文档索引.md` 获取全量导航"的用法引导**
@@ -159,7 +160,7 @@ mcp/
 **验证**
 
 - [ ] `GET /health` 返回 200 且字段完整
-- [ ] `GET /search?q=固件指令集&limit=3` 返回 3 条结果，路径与分数合理
+- [ ] `GET /search?q=规格汇总&limit=3` 返回 3 条结果，路径与分数合理
 - [ ] `myMemory-get-document` 传 `../../etc/passwd`、`/etc/passwd`、`wiki/index.md`、
       `raw/../raw/文档索引.md` 四种路径，**全部被拒绝**（前三种不在集合内，第四种字符串不匹配）
 - [ ] `myMemory-get-document` 传 `raw/文档索引.md` 成功，`total_chars` 与实际一致
@@ -179,19 +180,19 @@ mcp/
 
    | # | 测试问题 | 期望命中方向 |
    |---|---|---|
-   | 1 | EFR32BG21 固件指令集有哪些震动控制指令 | `Company_Facts_And_Status/固件指令集.md` |
-   | 2 | 推荐方案里 R 是怎么生成的，无按键玩具怎么处理 | `Solution_Design_Docs/推荐方案*` |
-   | 3 | 8 月 4 日跨部门同步会议的结论是什么 | `Solution_Meeting_Docs/26-08-04-*` |
-   | 4 | LESC 配对的中间人防护机制 | `Technological_Knowledge/LESC-*` |
-   | 5 | BtleJack 能做什么攻击 | `Technological_Knowledge/*` |
-   | 6 | MSD 广播里的 Company ID 怎么申请 | `Technological_Knowledge/*MSD*` |
+   | 1 | ABC123456 的技术规格都有哪些性能指标 | `Facts_And_Status/规格汇总.md` |
+   | 2 | 推荐方案里某机制是怎么实现的，例外场景怎么处理 | `Design_Docs/推荐方案*` |
+   | 3 | 8 月 4 日同步例会的结论是什么 | `Record_Docs/26-08-04-*` |
+   | 4 | SecProto 的方案设计要点 | `Technological_Knowledge/SecProto-*` |
+   | 5 | Toolkit 的原理与防御 | `Technological_Knowledge/*` |
+   | 6 | 行业标准编号怎么申请 | `Technological_Knowledge/*标准*` |
 
    实际执行结果与三轮调优过程见 [RETRIEVAL-NOTES.md](RETRIEVAL-NOTES.md)。
 
 5. **失败样本记录**：任何 top-5 无有效证据的问题，记录到 `docs/RETRIEVAL-NOTES.md`，
    分析是分词问题、切块问题还是 BM25 参数问题
 6. **可调旋钮**（按此顺序尝试，每次只动一个）：
-   - jieba 自定义词典：把 `EFR32BG21A010F768`、`LESC`、`BtleJack`、`Tophy` 等
+   - jieba 自定义词典：把 `ABC123456A010F768`、`SecProto`、`Toolkit`、`DevKitA` 等
      专有名词加入词典，防止被错误切分（**这是最可能有效的一步**）
    - `chunk_size` / `overlap`
    - BM25 的 `k1` / `b` 参数
@@ -240,7 +241,7 @@ mcp/
 |---|---|---|---|
 | jieba 把专有名词切碎导致检索不准 | **高** | 检索质量不达标 | P4 已列为首选调优手段：自定义词典。词典文件纳入 git |
 | P4 抽样验收不通过（< 5/6） | 中 | 需要返工调优 | 先穷尽 P4 第 6 步的三个旋钮；仍不达标则重新评估 [ADR-0002](adr/0002-bm25-over-vectors.md)（引入向量混合），这是**唯一会推翻既有决策**的路径 |
-| 固定窗口切块导致会议转录检索体验差 | 中 | 部分问题需多次 get_document | 已在 [ADR-0005](adr/0005-fixed-window-chunking.md) 中接受；若实测严重，改动面仅限 `corpus.py` 的切块函数 |
+| 固定窗口切块导致长篇转录类检索体验差 | 中 | 部分问题需多次 get_document | 已在 [ADR-0005](adr/0005-fixed-window-chunking.md) 中接受；若实测严重，改动面仅限 `corpus.py` 的切块函数 |
 | `uvicorn` / `rank_bm25` 版本与 `mcp 2.1.1` 冲突 | 低 | 装不上 | P1 立即暴露；锁版本前先跑一次完整 install |
 | 使用方运行环境无法访问 PyPI | 低 | 装不上依赖 | README 中给出离线安装说明（`pip download` + `pip install --no-index`） |
 

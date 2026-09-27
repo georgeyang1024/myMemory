@@ -1,4 +1,4 @@
-﻿"""index 层单测：分词、检索排序、多样性约束、快照不变量、轮询重建与失败保护。"""
+"""index 层单测：分词、检索排序、多样性约束、快照不变量、轮询重建与失败保护。"""
 
 import os
 import sys
@@ -17,17 +17,17 @@ from test_corpus import make_config  # noqa: F401  复用配置构造
 @pytest.fixture
 def kb_root(tmp_path: Path) -> Path:
     raw = tmp_path / "memory"
-    (raw / "Solution_Meeting_Docs" / "26-08-04-跨部门同步").mkdir(parents=True)
-    (raw / "Company_Facts_And_Status").mkdir(parents=True)
+    (raw / "Record_Docs" / "26-08-04-同步").mkdir(parents=True)
+    (raw / "Facts_And_Status").mkdir(parents=True)
 
-    # 正文中不含"固件指令集"四字，语义完全在文件名上——用于验证路径进索引
-    (raw / "Company_Facts_And_Status" / "固件指令集.md").write_text(
-        "| 震动控制 | Vibrate:x; | 马达以x档开始震动 |\n" * 40, encoding="utf-8"
+    # 正文中不含"规格汇总"四字，语义完全在文件名上——用于验证路径进索引
+    (raw / "Facts_And_Status" / "规格汇总.md").write_text(
+        "| 字段 | Field:x; | 单元以x档开始运转 |\n" * 40, encoding="utf-8"
     )
-    (raw / "Solution_Meeting_Docs" / "26-08-04-跨部门同步" / "纪要.md").write_text(
-        "会议讨论了 LESC 配对与中间人攻击的防护措施。" * 30, encoding="utf-8"
+    (raw / "Record_Docs" / "26-08-04-同步" / "纪要.md").write_text(
+        "记录了 SecProto 机制与防护措施的要点。" * 30, encoding="utf-8"
     )
-    (raw / "Company_Facts_And_Status" / "无关.md").write_text(
+    (raw / "Facts_And_Status" / "无关.md").write_text(
         "这是一篇完全无关的文档，只讲包装设计。" * 30, encoding="utf-8"
     )
     return tmp_path
@@ -40,23 +40,23 @@ def build_index(root: Path, **overrides) -> index.IndexSnapshot:
 # --- 分词 -------------------------------------------------------------------
 
 def test_tokenize_lowercases():
-    assert "lesc" in index.tokenize("LESC 配对")
+    assert "secproto" in index.tokenize("SecProto 机制")
 
 
 def test_tokenize_path_splits_separators():
-    tokens = index.tokenize_path("Solution_Meeting_Docs/26-08-04-跨部门同步/纪要.md")
-    assert {"solution", "meeting", "docs", "跨部门", "纪要"} <= set(tokens)
+    tokens = index.tokenize_path("Record_Docs/26-08-04-同步/纪要.md")
+    assert {"record", "docs", "同步", "纪要"} <= set(tokens)
 
 
 def test_tokenize_keeps_date_atomic():
     """日期必须作为整体存在，且不发出 26/08/04 碎片。
 
-    这三个碎片出现在几乎每一个会议目录里，IDF 被稀释到没有区分度，
+    这三个碎片出现在几乎每一个日期目录里，IDF 被稀释到没有区分度，
     却仍会靠词频把无关文档顶上来。
     """
     for tokens in (
-        index.tokenize("26-08-04 跨部门同步"),
-        index.tokenize_path("Solution_Meeting_Docs/26-08-04-跨部门同步/纪要.md"),
+        index.tokenize("26-08-04 同步"),
+        index.tokenize_path("Record_Docs/26-08-04-同步/纪要.md"),
     ):
         assert "26-08-04" in tokens
         assert "26" not in tokens and "08" not in tokens and "04" not in tokens
@@ -95,17 +95,17 @@ def test_snapshot_describe_fields(kb_root: Path):
 
 def test_search_matches_filename_semantics(kb_root: Path):
     """文件名承载的语义必须可检索——正文里没有这四个字。"""
-    _, hits = build_index(kb_root).search("固件指令集", 3)
-    assert hits and hits[0].path.endswith("固件指令集.md")
+    _, hits = build_index(kb_root).search("规格汇总", 3)
+    assert hits and hits[0].path.endswith("规格汇总.md")
 
 
 def test_search_matches_directory_date(kb_root: Path):
-    _, hits = build_index(kb_root).search("26-08-04 跨部门同步", 3)
+    _, hits = build_index(kb_root).search("26-08-04 同步", 3)
     assert hits and "26-08-04" in hits[0].path
 
 
 def test_search_scores_descending(kb_root: Path):
-    _, hits = build_index(kb_root).search("LESC 中间人攻击", 5)
+    _, hits = build_index(kb_root).search("SecProto 机制", 5)
     assert [h.score for h in hits] == sorted((h.score for h in hits), reverse=True)
 
 
@@ -119,7 +119,7 @@ def test_search_empty_query_returns_nothing(kb_root: Path):
 
 
 def test_search_respects_limit(kb_root: Path):
-    _, hits = build_index(kb_root).search("LESC", 1)
+    _, hits = build_index(kb_root).search("SecProto", 1)
     assert len(hits) == 1
 
 
@@ -128,14 +128,14 @@ def test_search_diversity_cap_per_document(tmp_path: Path):
     raw = tmp_path / "memory"
     raw.mkdir(parents=True)
     # 大文件：多个 chunk 全部高度相关
-    (raw / "大文档.md").write_text("LESC 配对 中间人 攻击 防护 措施。" * 400, encoding="utf-8")
+    (raw / "大文档.md").write_text("SecProto 机制 攻击 防护 措施。" * 400, encoding="utf-8")
     # 小文件：只有一个 chunk，同样相关
-    (raw / "小文档.md").write_text("LESC 配对 中间人 攻击 防护 措施。", encoding="utf-8")
+    (raw / "小文档.md").write_text("SecProto 机制 攻击 防护 措施。", encoding="utf-8")
 
     snapshot = build_index(tmp_path)
     assert len([c for c in snapshot.chunks if c.path == "大文档.md"]) > 2
 
-    _, hits = snapshot.search("LESC 配对 中间人 攻击", 3)
+    _, hits = snapshot.search("SecProto 机制 攻击", 3)
     counts: dict[str, int] = {}
     for hit in hits[:index.MAX_CHUNKS_PER_DOC + 1]:
         counts[hit.path] = counts.get(hit.path, 0) + 1
@@ -145,7 +145,7 @@ def test_search_diversity_cap_per_document(tmp_path: Path):
 
 def test_hit_offsets_map_back_to_content(kb_root: Path):
     snapshot = build_index(kb_root)
-    _, hits = snapshot.search("LESC", 3)
+    _, hits = snapshot.search("SecProto", 3)
     for hit in hits:
         source = snapshot.contents[(hit.source, hit.path)]
         assert source[hit.char_start : hit.char_end] == hit.text
@@ -171,7 +171,7 @@ def test_holder_rebuilds_on_change(kb_root: Path):
     first = holder.build_now()
     holder.start_polling()
     try:
-        (kb_root / "memory" / "新增文档.md").write_text("新增内容 LESC", encoding="utf-8")
+        (kb_root / "memory" / "新增文档.md").write_text("新增内容 SecProto", encoding="utf-8")
         deadline = time.time() + 15
         while time.time() < deadline and holder.snapshot is first:
             time.sleep(0.2)
@@ -210,11 +210,11 @@ def test_polling_disabled_when_interval_zero(kb_root: Path):
 
 @pytest.fixture
 def multi_root(tmp_path: Path) -> Path:
-    for name in ("memory", "team", "company"):
+    for name in ("memory", "team", "org"):
         (tmp_path / name).mkdir()
-    (tmp_path / "memory" / "配对.md").write_text("个人记录：LESC 配对心得。", encoding="utf-8")
-    (tmp_path / "team" / "配对.md").write_text("团队规范：LESC 配对流程。", encoding="utf-8")
-    (tmp_path / "company" / "制度.md").write_text("报销制度说明。", encoding="utf-8")
+    (tmp_path / "memory" / "机制.md").write_text("个人记录：SecProto 机制心得。", encoding="utf-8")
+    (tmp_path / "team" / "机制.md").write_text("团队规范：SecProto 机制流程。", encoding="utf-8")
+    (tmp_path / "org" / "制度.md").write_text("报销制度说明。", encoding="utf-8")
     return tmp_path
 
 
@@ -222,31 +222,31 @@ def multi_config(root: Path, **overrides):
     return make_config(root, sources=[
         {"name": "memory", "dir": str(root / "memory")},
         {"name": "team", "dir": str(root / "team")},
-        {"name": "company", "dir": str(root / "company"), "writable": False},
+        {"name": "org", "dir": str(root / "org"), "writable": False},
     ], **overrides)
 
 
 def test_indexed_set_is_source_path_pairs(multi_root: Path):
     snapshot = index.build(multi_config(multi_root))
-    assert ("memory", "配对.md") in snapshot.indexed_paths
-    assert ("team", "配对.md") in snapshot.indexed_paths
-    assert "配对.md" not in snapshot.indexed_paths
+    assert ("memory", "机制.md") in snapshot.indexed_paths
+    assert ("team", "机制.md") in snapshot.indexed_paths
+    assert "机制.md" not in snapshot.indexed_paths
 
 
 def test_search_spans_all_sources_by_default(multi_root: Path):
-    _, hits = index.build(multi_config(multi_root)).search("LESC 配对", 5)
+    _, hits = index.build(multi_config(multi_root)).search("SecProto 机制", 5)
     assert {h.source for h in hits} == {"memory", "team"}
 
 
 def test_search_can_be_scoped_to_one_source(multi_root: Path):
-    total, hits = index.build(multi_config(multi_root)).search("LESC 配对", 5, source="team")
+    total, hits = index.build(multi_config(multi_root)).search("SecProto 机制", 5, source="team")
     assert total == 1 and [h.source for h in hits] == ["team"]
 
 
 def test_source_name_is_searchable(multi_root: Path):
-    """source 名参与分词：直接搜 company 就能摸到只读库里有什么。"""
-    _, hits = index.build(multi_config(multi_root)).search("company", 5)
-    assert hits and hits[0].source == "company"
+    """source 名参与分词：直接搜 org 就能摸到只读库里有什么。"""
+    _, hits = index.build(multi_config(multi_root)).search("org", 5)
+    assert hits and hits[0].source == "org"
 
 
 # --- 增量更新 ---------------------------------------------------------------
@@ -266,8 +266,8 @@ def test_incremental_reuses_unchanged_entries(kb_root: Path):
 def test_incremental_picks_up_changes_and_deletions(kb_root: Path):
     config = make_config(kb_root)
     first, _ = _refresh(config, {})
-    target = kb_root / "memory" / "Company_Facts_And_Status" / "无关.md"
-    target.write_text("改过了：LESC", encoding="utf-8")
+    target = kb_root / "memory" / "Facts_And_Status" / "无关.md"
+    target.write_text("改过了：SecProto", encoding="utf-8")
     os.utime(target, (time.time() + 5, time.time() + 5))
     (kb_root / "memory" / "新.md").write_text("新文件", encoding="utf-8")
     gone = next(k for k in first if k[1].endswith("纪要.md"))
@@ -275,7 +275,7 @@ def test_incremental_picks_up_changes_and_deletions(kb_root: Path):
 
     cache = index.ContentCache(0)
     second, _ = _refresh(config, first, cache=cache)
-    changed = ("memory", "Company_Facts_And_Status/无关.md")
+    changed = ("memory", "Facts_And_Status/无关.md")
     assert second[changed] is not first[changed]
     assert "改过了" in cache.get(changed, second[changed].version), "重读的全文进了全文缓存"
     assert ("memory", "新.md") in second
@@ -300,7 +300,7 @@ def test_offline_refresh_still_merges_agent_marks(multi_root: Path, monkeypatch)
     """
     config = multi_config(multi_root)
     first, _ = _refresh(config, {})
-    key = ("team", "配对.md")
+    key = ("team", "机制.md")
     _offline(monkeypatch, "team")
     marked, availability = _refresh(config, first, agent_marks={key: first[key].mtime})
     assert availability["team"] == Availability(False, DISK_OFFLINE)
@@ -317,7 +317,7 @@ def test_read_failure_still_merges_agent_marks(kb_root: Path, monkeypatch):
     """单文件读取失败沿用旧条目时，同样要并入 agent 标记。"""
     config = make_config(kb_root)
     first, _ = _refresh(config, {})
-    key = ("memory", "Company_Facts_And_Status/无关.md")
+    key = ("memory", "Facts_And_Status/无关.md")
     real_read = storage.LocalStorage.read_text
 
     def read_text(self, path):
@@ -463,7 +463,7 @@ def test_cache_roundtrip_serves_without_rebuilding(kb_root: Path, monkeypatch):
     monkeypatch.undo()  # 检索本身要给查询词分词
     assert loaded is not None
     assert loaded.indexed_paths == built.indexed_paths
-    assert loaded.search("固件指令集", 3)[1][0].path == built.search("固件指令集", 3)[1][0].path
+    assert loaded.search("规格汇总", 3)[1][0].path == built.search("规格汇总", 3)[1][0].path
 
 
 @pytest.mark.parametrize("damage", ["garbage", "fingerprint", "format"])
@@ -493,7 +493,7 @@ def test_cache_fingerprint_changes_with_chunking(kb_root: Path):
 def test_start_uses_cache_then_verifies_in_background(kb_root: Path):
     config = make_config(kb_root)
     index.IndexHolder(config).build_now()
-    (kb_root / "memory" / "关机期间新增.md").write_text("LESC 新内容", encoding="utf-8")
+    (kb_root / "memory" / "关机期间新增.md").write_text("SecProto 新内容", encoding="utf-8")
 
     holder = index.IndexHolder(config)
     first = holder.start()
@@ -518,7 +518,7 @@ def test_offline_source_survives_restart_via_cache(multi_root: Path, monkeypatch
         time.sleep(0.05)
     snapshot = holder.snapshot
     assert snapshot.availability_of("team").reason == DISK_OFFLINE
-    assert snapshot.search("LESC 配对", 5, source="team")[0] == 1
+    assert snapshot.search("SecProto 机制", 5, source="team")[0] == 1
 
 
 def test_reindex_full_request_upgrades_pending_round(kb_root: Path, monkeypatch):
@@ -576,7 +576,7 @@ def cache_root(tmp_path: Path) -> Path:
     mem = tmp_path / "memory"
     mem.mkdir()
     for name in ("甲.md", "乙.md", "丙.md"):
-        (mem / name).write_text(f"LESC {name} 的正文", encoding="utf-8")
+        (mem / name).write_text(f"SecProto {name} 的正文", encoding="utf-8")
     return tmp_path
 
 
@@ -585,7 +585,7 @@ def test_all_docs_indexed_but_only_n_contents_cached(cache_root: Path):
     snapshot = index.build(make_config(cache_root, max_cached_docs=1))
     assert snapshot.doc_count == 3
     assert len(snapshot.cache) == 1
-    assert snapshot.search("LESC", 5)[0] == 3
+    assert snapshot.search("SecProto", 5)[0] == 3
 
 
 def test_uncached_content_is_read_from_disk_and_cached_lru(cache_root: Path):
@@ -615,7 +615,7 @@ def test_offline_and_uncached_content_is_unavailable(cache_root: Path, monkeypat
     assert snapshot.contents[cached[0]], "在缓存里的照常可读"
     with pytest.raises(index.ContentUnavailable):
         snapshot.contents[uncached[0]]
-    total, hits = snapshot.search("LESC", 5)
+    total, hits = snapshot.search("SecProto", 5)
     assert total == 3, "检索照常"
     assert sum(h.text is None for h in hits) == 2, "不在缓存且掉盘的，片段取不到"
 

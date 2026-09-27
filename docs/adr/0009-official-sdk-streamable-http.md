@@ -10,8 +10,8 @@
 
 ## 理由
 
-Streamable HTTP 正是团队既有 `mobileKnowledgeBase` 的形态
-（`{"type":"http","url":"http://192.168.4.234:7081/mcp"}`），客户端配法完全一致，
+Streamable HTTP 正是团队既有知识库服务的形态
+（`{"type":"http","url":"http://<内网服务器>:<端口>/mcp"}`），客户端配法完全一致，
 团队认知成本为零。旧的 HTTP+SSE 双端点传输已被规范标记为 legacy。
 
 手写 JSON-RPC 需自行实现 initialize 握手、`tools/list`、`tools/call`、会话管理，
@@ -23,7 +23,7 @@ REST 端点的价值：`/health` 让部署后用一条 curl 即可确认服务�
 
 ## SDK API 实测结论（重要）
 
-**`mcp` 2.x 已将 `FastMCP` 更名为 `MCPServer`**，v1 代码不兼容：
+**`mcp` 2.x 已将 `FastMCP` 更名为 `MCPServer`**，v1 代码无法直接运行：
 
 ```python
 from mcp.server.mcpserver import MCPServer          # 2.x 正确入口

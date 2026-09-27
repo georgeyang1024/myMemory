@@ -1,4 +1,4 @@
-﻿"""服务层：MCP 工具定义、REST 端点、入参校验、响应裁剪与序列化。
+"""服务层：MCP 工具定义、REST 端点、入参校验、响应裁剪与序列化。
 
 本模块不做检索逻辑（那是 index.py 的职责），也不做落盘逻辑（那是 writer.py 的职责）。
 """
@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse
 from config import Config
 from index import ContentUnavailable, Hit, IndexHolder, IndexSnapshot
 from storage import DISK_OFFLINE, open_storage
-from writer import WriteError, save_memory
+from writer import WriteError, delete_memory, merge_memory, rename_memory, replace_memory, save_memory
 from version import __version__
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ RECENT_DEFAULT = 10
 RECENT_MAX = 20
 
 SERVER_INSTRUCTIONS = """\
-**操作者（人）与 AI 共同的记忆系统。** 双方都往里写、都从里读。
+操作者（人）与 AI 共同的记忆系统。双方都往里写、都从里读。
 主题不限、范围不限——工作、技术、生活、想法都可能在里面。
 
 记忆是本机上的 Markdown 文件，本质是跨会话的长期记忆。
@@ -39,19 +39,19 @@ SERVER_INSTRUCTIONS = """\
 
 ## 形态
 
-- 记忆分属若干 **source**（个人、团队、公司……），一篇记忆 = `source` + `path`。
+- 记忆分属若干'source'（个人、团队、组织……），一篇记忆 = `source` + `path`。
 - 有哪些 source、哪些可写：调 `list-sources`；每条返回都带 `writable`。
-- **你**：`save` 写入（分类只有一级，不存在会自动创建，可为空写在根目录）。
-- **人**：随时用编辑器直接增删改，改动照常进索引。
+- 你：`save` 写入（分类只有一级，不存在会自动创建，可为空写在根目录）。
+- 人：随时用编辑器直接增删改，改动照常进索引。
 
 ## 两条规矩
 
-1. 返回的是**原文片段，不是答案**。结论由你写，并标注来源。
+1. 返回的是*原文片段，不是答案*。结论由你写，并标注来源。
 2. 写入前先 `search`：同名会直接覆盖。
 
 ## 检索特性
 
-BM25 关键词匹配，**不做同义改写**：搜不到就换记忆里实际写过的词，
+BM25 关键词匹配，不做同义改写：搜不到就换记忆里实际写过的词，
 或用 source 名、分类名、文件名、日期（`26-08-04`）这类专有名词定位。
 """
 
@@ -84,6 +84,29 @@ RECENT_DESCRIPTION = """\
 最近更新的文档，按时间倒序，每文件一条。
 edited_by 区分 agent（经 save 写入）/ scan（扫描发现改动，可能是人改的，也可能是别的设备或程序改的）。
 绕过本服务的改动要等下一次索引刷新后才出现。\
+"""
+
+RENAME_DESCRIPTION = """\
+给一篇记忆改名或移到另一个一级分类（同一个 source 内）。目标已存在即拒绝，不覆盖。
+old_path / new_path 原样取自 search/recent 的 path（.md 可带可不带），不含 source 名。
+新文件名要与现有文件不同名，否则会被拒；改名成功后旧 path 不再存在。\
+"""
+
+REPLACE_DESCRIPTION = """\
+在一篇记忆的全文里做字面替换 old_string → new_string，命中几处换几处，返回替换次数。
+完全字面匹配：空格与换行必须逐字一致，不做正则、不做大小写折叠、不归一化换行。
+old_string 命中 0 处或 new_string 为空都会被拒绝且不改动文件；整篇重写请改用 save。\
+"""
+
+MERGE_DESCRIPTION = """\
+把一篇记忆并入另一篇已存在的记忆（同一个 source 内），然后删除源文件。
+并入段以 ## 源文件路径 为标题、前有 --- 分隔线，来源可追溯。
+from_path 与 to_path 都原样取自 search/recent 的 path；目标必须已存在，新建用 save。\
+"""
+
+DELETE_DESCRIPTION = """\
+真删一篇记忆：无备份、不可恢复。删除能力默认关，开启后才出现在工具列表。
+path 原样取自 search/recent 的返回值；删除是最终操作，删错只能重新 save。\
 """
 
 
@@ -293,6 +316,117 @@ def run_save(config: Config, holder: IndexHolder, source: str,
     }
 
 
+def run_rename(config: Config, holder: IndexHolder, source: str,
+               old_path: str, new_path: str) -> dict[str, Any]:
+    """rename 的纯逻辑部分。与 run_save 同一形态：WriteError 翻译成响应体，
+    成功后记下 agent 标记并触发后台增量刷新。
+
+    旧路径是删、新路径是增：一改一删两条变化都靠同一轮刷新进索引，
+    返回体里照例要提醒"新旧 path 此刻可能都搜不准"。
+    """
+    try:
+        written = rename_memory(config, source, old_path, new_path)
+    except WriteError as exc:
+        target = config.source((source or "").strip())
+        if target is not None:
+            if holder.update_availability(target.name, open_storage(target).probe()):
+                holder.request_rebuild(f"改名 {target.name} 失败后可用性变化")
+        return {"renamed": False, "error": str(exc),
+                "writable_sources": _writable_sources(config, holder.snapshot)}
+
+    holder.mark_agent(written.source, written.path, written.mtime)
+    started = holder.request_rebuild(f"改名记忆 {written.source} {old_path} → {written.path}")
+    return {
+        "renamed": True,
+        "source": written.source,
+        "old_path": old_path.strip(),
+        "path": written.path,
+        "index_refresh": "started" if started else "merged",
+    }
+
+
+def run_replace(config: Config, holder: IndexHolder, source: str, path: str,
+                old_string: str, new_string: str) -> dict[str, Any]:
+    """replace 的纯逻辑部分。响应里的 replaced_count 是调用方唯一的"改了几处"凭据。"""
+    try:
+        written = replace_memory(config, source, path, old_string, new_string)
+    except WriteError as exc:
+        target = config.source((source or "").strip())
+        if target is not None:
+            if holder.update_availability(target.name, open_storage(target).probe()):
+                holder.request_rebuild(f"替换 {target.name} 失败后可用性变化")
+        return {"replaced": False, "error": str(exc),
+                "writable_sources": _writable_sources(config, holder.snapshot)}
+
+    holder.mark_agent(written.source, written.path, written.mtime)
+    started = holder.request_rebuild(f"替换记忆 {written.source}/{written.path} 的内容")
+    return {
+        "replaced": True,
+        "source": written.source,
+        "path": written.path,
+        "replaced_count": written.replaced_char_count,
+        "char_count": written.char_count,
+        "index_refresh": "started" if started else "merged",
+    }
+
+
+def run_merge(config: Config, holder: IndexHolder, source: str,
+              from_path: str, to_path: str) -> dict[str, Any]:
+    """merge 的纯逻辑部分。
+
+    一调用两条磁盘变化（目标更新 + 源文件删除），索引要等刷新后才会
+    反映出来；source_removed=False 时内容已安全并入，只是源文件没删掉。
+    """
+    try:
+        written = merge_memory(config, source, from_path, to_path)
+    except WriteError as exc:
+        target = config.source((source or "").strip())
+        if target is not None:
+            if holder.update_availability(target.name, open_storage(target).probe()):
+                holder.request_rebuild(f"合并 {target.name} 失败后可用性变化")
+        return {"merged": False, "error": str(exc),
+                "writable_sources": _writable_sources(config, holder.snapshot)}
+
+    holder.mark_agent(written.source, written.path, written.mtime)
+    started = holder.request_rebuild(f"合并记忆 {written.source} {from_path.strip()} → {written.path}")
+    return {
+        "merged": True,
+        "source": written.source,
+        "from_path": from_path.strip(),
+        "path": written.path,
+        "old_char_count": written.old_char_count,
+        "char_count": written.char_count,
+        "source_removed": written.source_removed,
+        "index_refresh": "started" if started else "merged",
+    }
+
+
+def run_delete(config: Config, holder: IndexHolder, source: str, path: str) -> dict[str, Any]:
+    """delete 的纯逻辑部分。文件已删，没有 agent 标记要落——刷新后条目自动消失。
+
+    删除被配置闸挡下时也走 WriteError → 响应体路径；工具在关闭时根本
+    不会注册，这条报错只为 config 变更窗口期兜底。
+    """
+    try:
+        written = delete_memory(config, source, path)
+    except WriteError as exc:
+        target = config.source((source or "").strip())
+        if target is not None:
+            if holder.update_availability(target.name, open_storage(target).probe()):
+                holder.request_rebuild(f"删除 {target.name} 失败后可用性变化")
+        return {"deleted": False, "error": str(exc),
+                "writable_sources": _writable_sources(config, holder.snapshot)}
+
+    started = holder.request_rebuild(f"删除记忆 {written.source}/{written.path}")
+    return {
+        "deleted": True,
+        "source": written.source,
+        "path": written.path,
+        "char_count": written.char_count,
+        "index_refresh": "started" if started else "merged",
+    }
+
+
 def run_list_sources(config: Config, snapshot: IndexSnapshot) -> dict[str, Any]:
     """不返回目录绝对路径：不向局域网调用方暴露磁盘结构。"""
     return {"sources": [
@@ -359,7 +493,10 @@ def run_health(config: Config, snapshot: IndexSnapshot, rebuilding: bool = False
 
 
 def create_server(config: Config, holder: IndexHolder) -> MCPServer:
-    """组装 MCP server：5 个工具 + 4 个 REST 端点。"""
+    """组装 MCP server：6 个常驻工具 + 4 个 REST 端点。
+    delete 与 merge 受 allow_mcp_delete 控制（默认关）：开启时才注册，
+    关闭时对 AI 彻底不可见。
+    """
     server = MCPServer(
         name="myMemory",
         title="人与 AI 的共同记忆",
@@ -398,7 +535,7 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
             "必填。source 名，原样取自 search / recent 的返回值。"
         ))],
         path: Annotated[str, Field(description=(
-            "文档路径，原样复制自 search 返回的 path，如 工作/周会纪要.md，"
+            "文档路径，原样复制自 search 返回的 path，如 工作/周报.md，"
             "不含 source 名。普遍含中文与空格，不要自行拼接或猜测。"
         ))],
         offset: Annotated[int, Field(description=(
@@ -435,6 +572,91 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
     ) -> str:
         payload = run_save(config, holder, source, category, filename, content)
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    @server.tool(
+        name="rename",
+        title="改名或移动记忆（不覆盖）",
+        description=RENAME_DESCRIPTION,
+    )
+    def tool_rename(
+        source: Annotated[str, Field(description=(
+            "必填。文件所在的 source，必须可写（list-sources 里 writable 为 true）。"
+        ))],
+        old_path: Annotated[str, Field(description=(
+            "现路径，原样复制自 search/recent 返回的 path，如 工作/旧名.md，"
+            "不含 source 名，.md 后缀可带可不带。"
+        ))],
+        new_path: Annotated[str, Field(description=(
+            "新路径，格式同 old_path。只换文件名或换一级分类均可；"
+            "目标已存在会被拒绝。"
+        ))],
+    ) -> str:
+        payload = run_rename(config, holder, source, old_path, new_path)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    @server.tool(
+        name="replace",
+        title="局部替换记忆内容",
+        description=REPLACE_DESCRIPTION,
+    )
+    def tool_replace(
+        source: Annotated[str, Field(description=(
+            "必填。文件所在的 source，必须可写（list-sources 里 writable 为 true）。"
+        ))],
+        path: Annotated[str, Field(description=(
+            "文件路径，原样复制自 search/recent 返回的 path，"
+            "不含 source 名，.md 后缀可带可不带。"
+        ))],
+        old_string: Annotated[str, Field(description=(
+            "要被替换的原文片段，必须逐字一致，建议连同少量上下文保证唯一。"
+        ))],
+        new_string: Annotated[str, Field(description=(
+            "替换后的文本，不能为空。要删除内容时请传改写后的剩余句子。"
+        ))],
+    ) -> str:
+        payload = run_replace(config, holder, source, path, old_string, new_string)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # delete 与 merge 都会真删文件，同受 allow_mcp_delete 断路器控制；
+    # 关闭时连注册都不注册——LLM 在 tools/list 里看不到，就不会去调用。
+    if config.allow_mcp_delete:
+
+        @server.tool(
+            name="merge",
+            title="合并两篇记忆（并删源）",
+            description=MERGE_DESCRIPTION,
+        )
+        def tool_merge(
+            source: Annotated[str, Field(description=(
+                "必填。两篇文件所在的 source，必须可写（list-sources 里 writable 为 true）。"
+            ))],
+            from_path: Annotated[str, Field(description=(
+                "要并入的源文件路径，原样复制自 search/recent 返回的 path，"
+                "不含 source 名，.md 后缀可带可不带。并入成功后此文件会被删除。"
+            ))],
+            to_path: Annotated[str, Field(description=(
+                "合并目标路径，格式同 from_path，必须已存在——不存在时先 save 再合并。"
+            ))],
+        ) -> str:
+            payload = run_merge(config, holder, source, from_path, to_path)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+
+        @server.tool(
+            name="delete",
+            title="删除记忆",
+            description=DELETE_DESCRIPTION,
+        )
+        def tool_delete(
+            source: Annotated[str, Field(description=(
+                "必填。文件所在的 source，必须可写（list-sources里writable为true）"
+            ))],
+            path: Annotated[str, Field(description=(
+                "文件路径，路径自search或recent返回的path，"
+                "不含source名，.md 后缀可带可不带。"
+            ))],
+        ) -> str:
+            payload = run_delete(config, holder, source, path)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
 
     @server.tool(
         name="list-sources",

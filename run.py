@@ -307,7 +307,7 @@ def write_bootstrap_config(path: Path, cm, directory: Path) -> None:
     data = cm.bootstrap_config_data_with_source(str(directory))
     cm.write_json_atomic(path, data)
     print(f"已写入 {path}")
-    print(f"记忆目录：{directory}。以后可用 source add 添加团队、公司等更多 source。")
+    print(f"记忆目录：{directory}。以后可用 source add 添加团队、组织等更多 source。")
 
 
 def ensure_config(passthrough: list[str]) -> None:

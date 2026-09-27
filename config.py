@@ -59,6 +59,10 @@ SETTABLE = {
     "poll_interval": ("秒", "关闭轮询"),
     "max_cached_docs": ("篇", "不限，全文全部常驻内存"),
 }
+# 配置项 → (含义, 开启时的后果)：布尔开关，取值 true/false。
+SETTABLE_BOOLS = {
+    "allow_mcp_delete": ("AI 能否删除记忆", "delete 工具与 merge 删源对 AI 开放"),
+}
 
 
 class CliError(Exception):
@@ -220,14 +224,26 @@ def source_remove(path: Path, args: argparse.Namespace) -> int:
 # --- config -----------------------------------------------------------------
 
 def config_set(path: Path, args: argparse.Namespace) -> int:
-    if args.key not in SETTABLE:
-        raise CliError(f"不支持通过 CLI 设置 {args.key}；可设置：{', '.join(sorted(SETTABLE))}。"
+    settable = sorted(set(SETTABLE) | set(SETTABLE_BOOLS))
+    if args.key not in settable:
+        raise CliError(f"不支持通过 CLI 设置 {args.key}；可设置：{', '.join(settable)}。"
                        f"其余配置请直接编辑 {path}")
+    data = copy.deepcopy(load(path))
+    if args.key in SETTABLE_BOOLS:
+        meaning, effect = SETTABLE_BOOLS[args.key]
+        values = {"true": True, "1": True, "yes": True,
+                  "false": False, "0": False, "no": False}
+        raw = args.value.strip().lower()
+        if raw not in values:
+            raise CliError(f"{args.key} 必须是 true 或 false，当前值：{args.value!r}")
+        data[args.key] = values[raw]
+        save(path, data)
+        say(f"已设置 {args.key} = {raw}（{meaning}；开启时{effect}）")
+        return finish(path, args)
     try:
         value = int(args.value)
     except ValueError as exc:
         raise CliError(f"{args.key} 必须是整数（{SETTABLE[args.key][0]}），当前值：{args.value!r}") from exc
-    data = copy.deepcopy(load(path))
     data[args.key] = value
     save(path, data)
     say(f"已设置 {args.key} = {value}" + (f"（0 表示{SETTABLE[args.key][1]}）" if value == 0 else ""))
@@ -318,8 +334,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=source_remove)
 
     cfg = sub.add_parser("config", help="修改配置").add_subparsers(dest="action", required=True)
-    p = cfg.add_parser("set", help="设置配置项：poll_interval（秒）、max_cached_docs（篇）")
-    p.add_argument("key", choices=sorted(SETTABLE))
+    p = cfg.add_parser("set", help="设置配置项：poll_interval（秒）、max_cached_docs（篇）、"
+                                   "allow_mcp_delete（true/false，AI 删除开关）")
+    p.add_argument("key", choices=sorted(set(SETTABLE) | set(SETTABLE_BOOLS)))
     p.add_argument("value")
     p.add_argument("--restart", action="store_true", help="改完后重启服务")
     p.set_defaults(func=config_set)

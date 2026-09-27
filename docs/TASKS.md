@@ -1,7 +1,7 @@
-# myMemory 0.1.0 任务清单
+# myMemory 任务清单（当前版本 0.2.0）
 
 > 依据：[REQUIREMENTS.md](REQUIREMENTS.md)（以下简称"需求"）
-> 第一轮（T1–T12）与第二轮（R1–R12）均已完成。
+> 第一轮（T1–T12）与第二轮（R1–R12）均已完成；第三轮（写入面扩展 + 删除断路器，§15）已完成。
 > 规则：逐项完成，完成一项勾选一项；每项完成后跑全量测试，保持绿色。
 
 ## 第一轮（已完成）
@@ -59,11 +59,11 @@ Windows 侧经 shellbridge 用 `.venv-windows` 跑 `--check` 与写入校验。
 
 | # | 需求 §11 验收标准 | 结果 | 证据 |
 |---|---|---|---|
-| 1 | 两读写 + 一只读（含挂载盘）启动，跨库检索，结果带独立 workspace 字段 | ✅ | E2E：memory/team/readonly/company 跨库命中；Windows：`readonly/zconfig` → `Z:\config`（`\\192.168.4.234\workspace\config`）自检通过 45 文档 |
+| 1 | 两读写 + 一只读（含挂载盘）启动，跨库检索，结果带独立 workspace 字段 | ✅ | E2E：memory/team/readonly/org 跨库命中；Windows：`readonly/zconfig` → `Z:\config`（UNC 挂载盘，路径已匿名化）自检通过 45 文档 |
 | 2 | 重叠/嵌套/不存在/重名/普通名以 readonly 开头 → 启动失败；CLI 拒绝且不改文件 | ✅ | `test_config.py`、`test_memctl.py::test_invalid_operations_leave_config_untouched`；E2E `--check` 退出码 2；Windows 大小写不同的嵌套目录同样被拒 |
 | 3 | save 只读被拒、带可写列表、磁盘无写入 | ✅ | E2E `save ro`；`test_run_save_to_readonly_lists_writable_workspaces`；storage 层兜底 `test_storage_refuses_readonly_even_if_writer_is_bypassed` |
 | 4 | save 缺 workspace 被拒；category 为空写到根目录 | ✅ | `test_missing_unknown_or_readonly_workspace_is_rejected`、`test_empty_category_writes_to_workspace_root`；schema `required` 含 workspace |
-| 5 | §7 放行用例全部成功、拒绝用例全部被拒 | ✅ | `test_common_ascii_symbols_are_allowed`（15 例）、`test_illegal_filename_is_rejected`（21 例）；E2E 与 Windows 均保存 `会议纪要(9月) v1.2.md`；Windows 拒绝 CON/nul.md/a:b/a\b/x. |
+| 5 | §7 放行用例全部成功、拒绝用例全部被拒 | ✅ | `test_common_ascii_symbols_are_allowed`（15 例）、`test_illegal_filename_is_rejected`（21 例）；E2E 与 Windows 均保存 `评审纪要(9月) v1.2.md`；Windows 拒绝 CON/nul.md/a:b/a\b/x. |
 | 6 | get-document 必须带 workspace；跨库同名 path 可区分 | ✅ | `test_get_document_requires_matching_workspace`、`test_indexed_set_is_workspace_path_pairs`；E2E 错 workspace 被拒并给出 `{workspace,path}` 建议 |
 | 7 | recent 默认 10 / 最多 20 / 每文件一条；agent → 再次改动后 scan；重启后 agent 保留 | ✅ | `test_recent_*`（6 例）；E2E：save 后 agent，编辑器追加 + reindex 后 scan，CLI `… --restart` 后 agent 标记仍在 |
 | 8 | CLI reindex 触发重建；服务未运行时提示 | ✅ | E2E：reindex 后编辑器新建的文件立即可检索；`test_reindex_when_service_down` |
@@ -145,7 +145,7 @@ Windows 侧经 shellbridge 用 `.venv-windows` 跑 `--check` 与写入校验。
 | 3 | 版本 0.1.0，无 v4 / 4.0.0 | ✅ | `/health` 与 MCP 握手 0.1.0；代码与文档已清理（仅 REQUIREMENTS 保留"此前版本作废"的历史说明） |
 | 4 | `GET /recent` JSON、默认 10 最多 20、workspace 过滤 | ✅ | E2E + `test_recent_endpoint_returns_json`；生产 `curl /recent?limit=3` |
 | 5 | 有缓存时数秒内监听，先 `verifying: true` 后 false | ✅ | 生产：缓存加载 0.42 s，CLI restart 全程 9 s；后台校验 9.6 s 后 `verifying` 转 false。E2E 中小样本校验只需 0.02 s，首个 `/health` 已为 false（以日志"已从缓存加载"为证） |
-| 6 | 部门知识库有缓存重启 ≤ 15 s，无变化不重读不重分词 | ✅ | 生产 1463 文档 / 21,411 块：重启 8–9 s（原 3.5–4 min）；日志"索引无变化（9.64s）"；`test_incremental_reuses_unchanged_entries` |
+| 6 | 部门知识库有缓存重启 ≤ 15 s，无变化不重读不重分词 | ✅ | 生产约 1460 文档 / 2.1 万块：重启 8–9 s（原 3.5–4 min）；日志"索引无变化（9.64s）"；`test_incremental_reuses_unchanged_entries` |
 | 7 | 缓存损坏 / 指纹变化 → 告警并全量构建 | ✅ | E2E 写入垃圾缓存后全量构建可用；`test_bad_cache_falls_back_to_full_build`（garbage / fingerprint / format） |
 | 8 | 掉盘：检索与全文可用、`stale`、`disk_offline`、不删除、恢复后自动更新 | ✅ | E2E（subst 删除后）：available=false / disk_offline、writable=false、条目保留、get-document 返回缓存全文且 stale=true、search 命中、save 被拒、其他 workspace 照常更新、全量重建不动掉盘条目；subst 恢复后自动可用且收录新文件 |
 | 9 | 启动时盘不在：警告、正常启动、缓存内容可检索 | ✅ | E2E 掉盘状态下重启 1.6 s 就绪，qd 的 2 个条目仍可检索；`test_offline_workspace_survives_restart_via_cache` |
@@ -154,7 +154,7 @@ Windows 侧经 shellbridge 用 `.venv-windows` 跑 `--check` 与写入校验。
 | 12 | reindex 默认增量、`--full` / `?full=1` 全量 | ✅ | E2E `mode` = incremental / full；`test_reindex_posts_to_running_service`（CLI URL 带 `?full=1`） |
 | 13 | agent 标记跨重启保留，不生成 status.json | ✅ | E2E 重启后仍为 agent；`test_run_save_marks_agent_in_index_and_cache`；E2E 目录中无 status.json |
 | 14 | `writable: false`：save 被拒，所有输出 writable=false | ✅ | E2E ro 在 search / get-document 中 writable=false、save 被拒且目录无写入；`test_writable_flag_on_every_document_output` |
-| 15 | 省略 writable 即可写；名称含 `/` 启动失败 | ✅ | `test_multiple_workspaces_and_writable_field`、`test_illegal_workspace_names_are_rejected`（含 `readonly/company`） |
+| 15 | 省略 writable 即可写；名称含 `/` 启动失败 | ✅ | `test_multiple_workspaces_and_writable_field`、`test_illegal_workspace_names_are_rejected`（含 `readonly/org`） |
 | 16 | 可写 workspace 掉盘 / 目录不存在时 writable=false | ✅ | E2E qd 掉盘后 writable=false；`test_offline_workspace_is_stale_and_not_writable` |
 | 17 | CLI add 必须 `--readonly`/`--writable`；edit 切换不改名；总写出 writable | ✅ | `test_add_requires_readonly_or_writable`、`test_edit_toggles_readonly_without_renaming`、`test_edit_rename_keeps_readonly`；生产重建的 config.json 三项均含 writable |
 | 18 | 全部测试在 Windows `.venv` 中通过 | ✅ | 303 passed, 1 skipped |
@@ -166,12 +166,52 @@ Windows 侧经 shellbridge 用 `.venv-windows` 跑 `--check` 与写入校验。
   CLI 写配置同样不再解析。新增 `test_configured_path_is_used_as_written_not_resolved`。
 - Windows 系统临时目录对 pytest 有权限问题：`pytest.ini` 把临时目录放到 `logs/pytest-tmp`。
 
-生产现状：`memory`（可写，137 文档）、`team`（只读，UNC 网络盘，1086 文档）、`newBleSec`（可写，240 文档），
-`index.cache` 57 MB。旧配置备份在本次会话的 scratchpad 中（`config.json.old`）。
+生产部署：`memory`（可写，~140 文档）、`team`（只读，UNC 网络盘，~1100 文档）、另有一个可写 source（~240 文档），
+`index.cache` ~57 MB。旧配置备份在本次会话的 scratchpad 中（`config.json.old`）。
 
 ### 追加：运行数据移出代码目录（2026-09-24）
 
 - [x] `config.json`、`index.cache`、`logs/`（日志与 PID）默认放在 `~/.myMemory/`；`MEMORY_CONFIG` 覆盖时随配置文件所在目录
 - [x] 测试临时目录改为 `~/.myMemory/pytest-tmp`（`tests/conftest.py`），`pytest.ini` 不再指向 `logs/`
-- [x] 生产数据迁移：停服务 → 移动到 `C:\Users\17915\.myMemory\` → 删除代码目录下的 `logs/` → 启动（有缓存 4 s 就绪）
+- [x] 生产数据迁移：停服务 → 移动到 `~/.myMemory/` → 删除代码目录下的 `logs/` → 启动（有缓存 4 s 就绪）
 - [x] Windows `.venv` 全量测试 304 passed, 1 skipped
+
+---
+
+## 第三轮（已完成 2026-09-27）：写入面扩展与删除断路器
+
+写入面新增 4 个 MCP 工具 + 一个配置断路器；决策过程为多轮共识问答，记录见
+[REQUIREMENTS](REQUIREMENTS.md) §15 与 [ADR-0006](adr/0006-two-tool-surface.md) /
+[ADR-0014](adr/0014-write-tool-boundary.md) 修订。
+
+- [x] **W1 rename**：同 source 内改名/移动一级分类；旧文件必须真实存在（文件系统判断，
+      不认识索引），目标存在即拒绝（不覆盖）；路径与 search 返回同形、.md 可带可不带
+- [x] **W2 replace**：全文完全字面的 old→new 替换（无正则/大小写折叠/换行归一化），
+      命中几处换几处并返回 `replaced_count`；0 命中、空 new_string、old==new 一律拒绝且不动文件
+- [x] **W3 merge**：把已存在的源并入已存在的目标后删除源文件；并入段带
+      `## 源文件相对路径` 标题与 `---` 分隔线；先写目标后删源，删除失败不回滚、
+      响应里 `source_removed: false` 如实标出
+- [x] **W4 delete + 断路器**：真删（unlink，无备份）；config.json 全局开关
+      `allow_mcp_delete`（默认 **false**，重启生效）——关闭时 `delete` 与 `merge`
+      连注册都不注册（tools/list 不可见），writer 层 `_require_delete_enabled`
+      用同一开关再兜一道闸
+- [x] **W5 支撑设施**：storage 层 `move()` / `remove()`（与 write_text 同一套
+      只读/目录缺失闸）；writer 层共用校验抽出（`_writable_target` /
+      `_validate_category` / `_validate_filename` / `_validate_location`）
+- [x] **W6 CLI**：`config.py config set allow_mcp_delete <true|false> [--restart]`；
+      非布尔值拒绝且不改配置文件
+- [x] **W7 文档同步**：README（工具面 9 个 + 开关 + CLI）、ARCHITECTURE（§6.4–6.7、
+      §8.3、模块表、风险表行 15）、GLOSSARY（edited_by、删除断路器词条）、
+      ADR-0006 / ADR-0014 修订标注
+
+### 第三轮验收（2026-09-27）
+
+自动化：Windows `.venv` 全量 `pytest` **402 passed, 1 skipped**（新增 rename 11 例、
+replace 9 例、merge 9 例、delete 11 例、config/cli/contract 同步用例）。
+端到端：真实服务经 `run.py --restart` 重启后，用官方 MCP 客户端（Streamable HTTP）
+实测 `list_tools` 返回 9 个工具（`allow_mcp_delete: true`），delete 参数 schema 正确；
+契约测试覆盖开关关闭态：`BASE_TOOLS` 之外 delete/merge 必须整体缺席。
+
+生产部署：生产 config.json 已用 `config.py config set allow_mcp_delete true` 开启
+（用户显式选择），服务已重启（PID 33848、端口 7083、索引 415 文档 / 4094 chunk）——
+此为唯一与默认配置不同的生产项，收回删除能力只需 `"allow_mcp_delete": false` + 重启。
