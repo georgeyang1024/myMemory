@@ -1,4 +1,4 @@
-﻿"""对外契约：客户端 initialize / tools/list 实际收到的东西。
+"""对外契约：客户端 initialize / tools/list 实际收到的东西。
 
 这里锁的不是实现，是**模型看得见的那部分**——服务说明、工具描述、
 参数 schema。它们是 LLM 决定要不要调、怎么调的唯一依据，
@@ -19,8 +19,11 @@ from server import create_server
 
 from test_corpus import make_config
 
-ALL_TOOLS = ["search", "get-document", "save",
-             "list-sources", "recent"]
+# 常驻工具（不含受 allow_mcp_delete 开关控制的 delete / merge）。
+BASE_TOOLS = ["search", "get-document", "save", "rename", "replace",
+              "list-sources", "recent"]
+
+ALL_TOOLS = [*BASE_TOOLS, "merge", "delete"]
 TOOLS_WITH_PARAMS = [t for t in ALL_TOOLS if t != "list-sources"]
 
 
@@ -28,8 +31,8 @@ TOOLS_WITH_PARAMS = [t for t in ALL_TOOLS if t != "list-sources"]
 def server(tmp_path: Path):
     root = tmp_path / "memory" / "技术"
     root.mkdir(parents=True)
-    (root / "BLE配对流程.md").write_text("配对与绑定。" * 50, encoding="utf-8")
-    config = make_config(tmp_path)
+    (root / "机制流程.md").write_text("机制与绑定。" * 50, encoding="utf-8")
+    config = make_config(tmp_path, allow_mcp_delete=True)
     holder = IndexHolder(config)
     holder.build_now()
     return create_server(config, holder)
@@ -89,6 +92,24 @@ def test_all_five_tools_exposed(tools):
     assert set(tools) == set(ALL_TOOLS)
 
 
+def test_delete_tools_hidden_until_enabled(tmp_path: Path):
+    """allow_mcp_delete 默认关闭：delete 与 merge 必须整体不存在于 tools/list。
+
+    隐藏比"列出但拒绝"更可靠——LLM 看不到就不会调用，也不会试图绕道
+    （比如用整篇替换把内容替换成空）。开启开关的唯一入口是人工改配置。
+    """
+    root = tmp_path / "memory" / "技术"
+    root.mkdir(parents=True)
+    (root / "机制流程.md").write_text("机制与绑定。" * 50, encoding="utf-8")
+    config = make_config(tmp_path)  # 不传 allow_mcp_delete：默认关
+    holder = IndexHolder(config)
+    holder.build_now()
+    server = create_server(config, holder)
+    tools = {tool.name for tool in asyncio.run(server.list_tools())}
+    assert set(BASE_TOOLS) == tools, "删除关闭时工具面必须收敛到基础集合"
+    assert "delete" not in tools and "merge" not in tools
+
+
 def test_tool_names_carry_no_server_prefix(tools):
     """客户端已按服务名做命名空间（mcp__myMemory__save），工具名再带 myMemory- 就重复了。"""
     assert not [name for name in tools if name.lower().startswith("mymemory")]
@@ -101,14 +122,12 @@ def test_tool_has_title_and_description(tools, name):
     assert tool.description and len(tool.description) > 80, "描述太短，不足以让模型判断何时该调"
 
 
-# 本项目由一个蓝牙方案知识库改造而来（见 docs/adr/0000-lineage.md）。
+# 本项目由一个知识库服务改造而来（见 docs/adr/0000-lineage.md）。
 # 这些词出现在对外文案里，说明有一处改名漏了——真实发生过：
-# 描述正文改完了，工具 title 还挂着"检索蓝牙方案知识库"，
+# 描述正文改完了，工具 title 还挂着"检索方案知识库"，
 # 而 title 是调用方在工具列表里最先看到的那一行。
 # 另加已被取代的口径：这套记忆是"人与 AI 共同的"，不是"个人的 / 我的"。
-# 实测踩过：描述正文改完了，工具 title 还挂着旧口径——而 title 是调用方
-# 在工具列表里最先看到的那一行。
-STALE_WORDS = ("蓝牙", "知识库", "语料", "ble-sec-kb", "dx-ble",
+STALE_WORDS = ("知识库", "语料",
                "个人记忆", "我的记忆", "使用者的记忆")
 
 

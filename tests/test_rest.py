@@ -1,4 +1,4 @@
-﻿"""REST 端点：/health、/search、POST /reindex，走真实的 ASGI 应用。
+"""REST 端点：/health、/search、POST /reindex，走真实的 ASGI 应用。
 
 不依赖 httpx：直接按 ASGI 协议发一个请求，拿回状态码与 JSON。
 """
@@ -43,13 +43,13 @@ def call(app, method: str, path: str, query: str = "") -> tuple[int, dict]:
 
 @pytest.fixture
 def setup(tmp_path: Path):
-    for name in ("memory", "company"):
+    for name in ("memory", "org"):
         (tmp_path / name).mkdir()
-    (tmp_path / "memory" / "配对.md").write_text("LESC 配对流程。", encoding="utf-8")
-    (tmp_path / "company" / "制度.md").write_text("LESC 合规制度。", encoding="utf-8")
+    (tmp_path / "memory" / "机制.md").write_text("SecProto 机制流程。", encoding="utf-8")
+    (tmp_path / "org" / "制度.md").write_text("SecProto 合规制度。", encoding="utf-8")
     config = make_config(tmp_path, sources=[
         {"name": "memory", "dir": str(tmp_path / "memory")},
-        {"name": "company", "dir": str(tmp_path / "company"), "writable": False},
+        {"name": "org", "dir": str(tmp_path / "org"), "writable": False},
     ])
     holder = IndexHolder(config)
     holder.build_now()
@@ -63,23 +63,23 @@ def test_health_lists_sources_and_config_file(setup):
     status, body = call(app, "GET", "/health")
     assert status == 200
     assert body["config_file"] == str(config.config_file)
-    assert [w["name"] for w in body["sources"]] == ["memory", "company"]
+    assert [w["name"] for w in body["sources"]] == ["memory", "org"]
     assert "git" not in body
 
 
 def test_search_endpoint_accepts_source(setup):
     _, _, app = setup
-    status, body = call(app, "GET", "/search", "q=LESC&source=company")
+    status, body = call(app, "GET", "/search", "q=SecProto&source=org")
     assert status == 200
-    assert [r["source"] for r in body["results"]] == ["company"]
+    assert [r["source"] for r in body["results"]] == ["org"]
 
-    status, body = call(app, "GET", "/search", "q=LESC")
-    assert {r["source"] for r in body["results"]} == {"memory", "company"}
+    status, body = call(app, "GET", "/search", "q=SecProto")
+    assert {r["source"] for r in body["results"]} == {"memory", "org"}
 
 
 def test_search_endpoint_unknown_source_is_400(setup):
     _, _, app = setup
-    status, body = call(app, "GET", "/search", "q=LESC&source=nope")
+    status, body = call(app, "GET", "/search", "q=SecProto&source=nope")
     assert status == 400 and body["error"]
 
 
@@ -132,11 +132,11 @@ def test_recent_endpoint_returns_json(setup):
     _, _, app = setup
     status, body = call(app, "GET", "/recent")
     assert status == 200 and body["returned"] == 2
-    assert {r["source"] for r in body["results"]} == {"memory", "company"}
-    assert {r["source"]: r["writable"] for r in body["results"]} == {"memory": True, "company": False}
+    assert {r["source"] for r in body["results"]} == {"memory", "org"}
+    assert {r["source"]: r["writable"] for r in body["results"]} == {"memory": True, "org": False}
     assert set(body["results"][0]) == {"source", "path", "writable", "updated_at", "size", "edited_by"}
 
-    status, body = call(app, "GET", "/recent", "limit=1&source=company")
+    status, body = call(app, "GET", "/recent", "limit=1&source=org")
     assert status == 200 and [r["path"] for r in body["results"]] == ["制度.md"]
 
     status, body = call(app, "GET", "/recent", "source=nope")

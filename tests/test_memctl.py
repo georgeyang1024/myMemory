@@ -1,4 +1,4 @@
-﻿"""config.py：人工管理 source 与刷新周期。
+"""config.py：人工管理 source 与刷新周期。
 
 校验失败时必须**一个字节都不改**：配置文件写坏了，服务下次就起不来。
 """
@@ -26,7 +26,7 @@ config_cli = load_cli_module()
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch):
-    for name in ("memory", "team", "company", "other"):
+    for name in ("memory", "team", "org", "other"):
         (tmp_path / name).mkdir()
     config = tmp_path / "config.json"
     config.write_text(json.dumps({
@@ -95,8 +95,8 @@ def test_missing_config_blocks_other_commands(tmp_path, monkeypatch, capsys):
 
 def test_add_readonly_sets_writable_false(env):
     root, config = env
-    assert config_cli.main(["source", "add", "company", "--dir", str(root / "company"), "--readonly"]) == 0
-    assert names(config) == ["memory", "company"], "只读不再改名"
+    assert config_cli.main(["source", "add", "org", "--dir", str(root / "org"), "--readonly"]) == 0
+    assert names(config) == ["memory", "org"], "只读不再改名"
     assert data(config)["sources"][1]["writable"] is False
 
 
@@ -213,6 +213,23 @@ def test_set_poll_interval(env):
     assert data(config)["poll_interval"] == 60
 
 
+def test_set_allow_mcp_delete(env):
+    _, config = env
+    assert data(config).get("allow_mcp_delete", False) is False, "默认必须关"
+    assert config_cli.main(["config", "set", "allow_mcp_delete", "true"]) == 0
+    assert data(config)["allow_mcp_delete"] is True
+    assert config_cli.main(["config", "set", "allow_mcp_delete", "false"]) == 0
+    assert data(config)["allow_mcp_delete"] is False
+
+
+@pytest.mark.parametrize("value", ["yes-please", "off", "2"])
+def test_set_allow_mcp_delete_rejects_non_boolean(env, value):
+    _, config = env
+    before = config.read_bytes()
+    assert config_cli.main(["config", "set", "allow_mcp_delete", value]) == 2
+    assert config.read_bytes() == before, "校验失败不得改配置文件"
+
+
 def test_only_poll_interval_is_settable(env):
     with pytest.raises(SystemExit):
         config_cli.main(["config", "set", "port", "8080"])
@@ -220,12 +237,12 @@ def test_only_poll_interval_is_settable(env):
 
 def test_list(env, capsys):
     root, _ = env
-    config_cli.main(["source", "add", "company", "--dir", str(root / "company"), "--readonly", "--desc", "制度"])
+    config_cli.main(["source", "add", "org", "--dir", str(root / "org"), "--readonly", "--desc", "制度"])
     capsys.readouterr()
     assert config_cli.main(["source", "list"]) == 0
     out = capsys.readouterr().out
     assert "memory" in out and "读写" in out
-    assert "company" in out and "只读" in out and "制度" in out
+    assert "org" in out and "只读" in out and "制度" in out
 
 
 def test_restart_flag_calls_run_py(env, monkeypatch):

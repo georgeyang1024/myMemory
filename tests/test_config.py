@@ -1,4 +1,4 @@
-﻿"""配置层：config.json 的定位、默认生成与 source 校验。
+"""配置层：config.json 的定位、默认生成与 source 校验。
 
 名称、重名、重叠、字段类型是启动即失败（fail fast）；目录访问不到则只警告——
 掉盘或目录被删除不该让整个服务起不来（需求 §8）。
@@ -70,12 +70,12 @@ def test_other_memory_env_vars_are_ignored(dirs, monkeypatch):
 def test_multiple_sources_and_writable_field(dirs):
     config = Config.load(write(dirs / "config.json", {"sources": [
         ws("a", dirs / "a"), ws("团队", dirs / "b", writable=True),
-        ws("company", dirs / "c", writable=False),
+        ws("org", dirs / "c", writable=False),
     ]}))
     by_name = {w.name: w for w in config.sources}
     assert by_name["a"].can_write, "省略 writable 即可写"
     assert by_name["团队"].can_write
-    assert not by_name["company"].can_write
+    assert not by_name["org"].can_write
     assert config.writable_sources == ["a", "团队"]
 
 
@@ -94,7 +94,7 @@ def test_writable_must_be_boolean(dirs, value):
 
 
 @pytest.mark.parametrize("name", [
-    "", "a/b", "../x", "a b", "a:b", "readonly/company", "readonly/", "x" * 65,
+    "", "a/b", "../x", "a b", "a:b", "readonly/org", "readonly/", "x" * 65,
 ])
 def test_illegal_source_names_are_rejected(dirs, name):
     with pytest.raises(ConfigError):
@@ -203,3 +203,30 @@ def test_max_cached_docs_defaults_to_1000(dirs):
     assert config.max_cached_docs == 1000
     assert Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")],
                                                     "max_cached_docs": 0})).max_cached_docs == 0
+
+
+# --- allow_mcp_delete：AI 删除断路器 ----------------------------------------
+
+def test_allow_mcp_delete_defaults_to_false(dirs):
+    """默认必须红线关闭：删除不可恢复，开闸只能人工显式配置。"""
+    config = Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")]}))
+    assert config.allow_mcp_delete is False
+
+
+def test_allow_mcp_delete_reads_boolean_value(dirs, monkeypatch):
+    data = {"sources": [ws("a", dirs / "a")], "allow_mcp_delete": True}
+    assert Config.load(write(dirs / "config.json", data)).allow_mcp_delete is True
+    data["allow_mcp_delete"] = False
+    assert Config.load(write(dirs / "config.json", data)).allow_mcp_delete is False
+
+
+@pytest.mark.parametrize("value", ["true", 1, "false", None])
+def test_allow_mcp_delete_must_be_boolean(dirs, value):
+    with pytest.raises(ConfigError, match="allow_mcp_delete"):
+        Config.load(write(dirs / "config.json", {
+            "sources": [ws("a", dirs / "a")], "allow_mcp_delete": value}))
+
+
+def test_describe_reports_allow_mcp_delete(dirs):
+    config = Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")]}))
+    assert config.describe()["allow_mcp_delete"] is False

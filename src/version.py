@@ -3,4 +3,4 @@
 架构设计见 docs/ARCHITECTURE.md，决策记录见 docs/adr/。
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
