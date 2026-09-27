@@ -3,7 +3,7 @@
 **状态**：已采纳并实施 · 2026-09-24
 
 "workspace"（工作区）暗示一个供人工作的地方，而这里的概念是**记忆的来源**：个人库、团队库、
-挂载进来的部门知识库、只读的公司文档。统一更名为 **source**（来源），覆盖代码标识符、
+挂载进来的挂载进来的部门库、只读的机构文档。统一更名为 **source**（来源），覆盖代码标识符、
 配置字段（`workspaces` → `sources`）、MCP 工具与参数（`list-workspaces` → `list-sources`，
 参数与输出字段 `workspace` → `source`，`writable_workspaces` → `writable_sources`）、
 CLI 子命令（原 `memctl.py workspace …`，现 `config.py source …`，CLI 已于 2026-09-25 由

@@ -6,8 +6,6 @@
 **A local-first memory service for humans and AI agents.**
 人与 AI 共同使用的本机记忆库：双方都往里写、都从里读，跨会话长期保存。
 
-当前版本 **0.1.0**。
-
 记忆就是普通的 Markdown / 文本文件，放在你自己指定的目录里——没有数据库、
 没有云端、没有锁定。AI 通过 MCP 工具检索与写入；你随时用编辑器直接增删改，
 改动照常进索引。
@@ -29,7 +27,7 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 
 ## 特点
 
-- **多 source**：个人、团队、公司……每个 source 对应一个目录，可放本地盘或挂载盘
+- **多 source**：个人、团队、组织……每个 source 对应一个目录，可放本地盘或挂载盘
 - **NAS、webDev跨设备**：记忆目录放 NAS\webDev，多台设备挂载远端文档共用同一份记忆
 - **全文检索**：BM25 关键词匹配 + jieba 分词，无向量、无外部服务
 - **证据而非答案**：检索返回带来源（source + path）的原文片段，结论由 AI 自己写
@@ -49,6 +47,7 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 - [配置](#配置)
 - [客户端接入](#客户端接入)
 - [部署（Windows）](#部署windows)
+- [更新记录](#更新记录)
 - [License](#license)
 
 ---
@@ -109,69 +108,34 @@ python3 run.py --logs         # 跟踪日志（Ctrl-C 只退出跟踪，不影�
 
 ## MCP 工具
 
-共 5 个工具。客户端看到的全名形如 `mcp__myMemory__save`
-（`mcp__<服务名>__<工具名>` 由客户端拼接）。
+常驻 7 个 + 删除类 2 个（默认隐藏），客户端看到的全名形如 `mcp__myMemory__save`
+（服务名+工具名由客户端拼接）。
 
-**记忆是本机上的 Markdown 文件**，本质是跨会话的长期记忆。
-一次对话里值得复用的结论、决定、上下文，应显式 `save` 成一篇，不要只留在对话里。
+| 工具 | 一句话说明 |
+|---|---|
+| `search(query, limit=5, source="")` | BM25 全文检索，默认跨全部 source；返回带 `source`/`path`/`writable` 的原文片段，source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词 |
+| `get-document(source, path, offset=0, limit=40000)` | 读取原文，字符级分页；响应带 `writable` 与 `stale`（掉盘时内容来自缓存） |
+| `save(source, filename, content, category="")` | 写一篇记忆到 `<source>/<category>/<filename>.md`；**已存在即整篇覆盖**（不可撤销、无备份），空正文拒绝 |
+| `rename(source, old_path, new_path)` | 同 source 内改名/移动一级分类；旧文件必须存在，**目标存在即拒绝**，不覆盖 |
+| `replace(source, path, old_string, new_string)` | 全文**完全字面**替换 old→new（无正则/大小写折叠），命中几处换几处并返回 `replaced_count`；0 命中或空 new_string 拒绝 |
+| `list-sources()` | 列出全部 source（`writable`/`available`/`doc_count`…），**不返回目录路径**；写入目标从这里选 |
+| `recent(limit=10, source="")` | 最近更新，每文件一条；`edited_by` 区分 `agent`（工具写入）/ `scan`（人改的或绕过服务的改动） |
+| `merge(source, from_path, to_path)`¹ | 把一篇**已存在**的记忆并入另一篇（并入段带 `## 来源` 标题与 `---` 分隔线），然后**删除源文件**；先写后删，删除失败以 `source_removed: false` 标出 |
+| `delete(source, path)`¹ | **真删**（无备份、不可恢复），`path` 与 `search` 返回同形 |
 
-### `search(query, limit=5, source="")`
+> ¹ `merge` / `delete` 都真删文件，受配置开关 `allow_mcp_delete`（默认 `false`，重启生效）
+> 控制：关闭时连工具都不会出现在 tools/list 里，LLM 看不到就不会调；开启需人工改配置。
 
-全文检索，返回带来源的原文片段，**默认跨全部 source**。
+**通用口径**（详细规则见各工具的参数描述与 docs/）：
 
-- `query` — 检索词，超过 500 字符会被截断
-- `limit` — 返回条数，越界自动钳制，不报错（默认上限 20，可配）
-- `source` — 可选，只在这个 source 内检索
-
-每条结果带独立的 `source`、`path`、`writable` 字段。source 名、分类目录名、
-文件名、日期（`26-08-04` 这类 YY-MM-DD）、长标识符（型号、协议名）都参与检索，
-可以直接用它们定位记忆。同一文档在结果中最多占 2 个位置，保证覆盖面。
-响应中的 `index` 字段给出索引构建时间与规模，可据此判断数据新鲜度。
-
-### `get-document(source, path, offset=0, limit=40000)`
-
-按 source + path 读取原文，支持字符级分页。
-
-- `source` / `path` — **必须是 `search` 或 `recent` 返回过的值**，不要自行拼接；
-  不在索引中会被拒绝，并返回最相近的候选 `{source, path}`
-- `offset` / `limit` — 分页参数；响应含 `has_more` 与 `next_offset`
-- 响应带 `writable` 与 `stale`：`stale: true` 表示该 source 掉盘、全文来自缓存
-
-### `save(source, filename, content, category="")`
-
-**持久化写入**：在 `<source目录>/<category>/<filename>.md` 落一个 Markdown 文件，
-分类为空时落在 source 根目录。**文件已存在时整篇覆盖，不可撤销、无备份。**
-
-- `source` — 必填，且必须 `writable: true`；配置只读、掉盘、目录不存在都会被拒绝
-- `category` — 一级分类目录名，不支持嵌套（`技术/协议` 会被拒绝）；不存在时自动创建
-- `filename` — `.md` 后缀可带可不带
-- `content` — **整篇内容**（不是追加），上限 100,000 字符；空正文一律拒绝
-
-分类名与文件名走字符白名单（中英文、数字、空格、连字符、下划线、全角标点、
-常用半角符号，长度 1–64 / 1–120）；`\ / : * ? " < > |`、`..`、首尾的 `.` 与空格、
-Windows 保留名（`CON` `NUL` `COM1-9` `LPT1-9` 等）一律拒绝，因此不可能跨目录保存。
-
-> **写入前先 `search` 查重**。覆盖没有备份；响应里的 `created` 与
-> `replaced_char_count` 是察觉旧内容已被替换的唯一线索。
-> 真正在意的记忆，把目录放进版本库才是可靠的兜底。
-
-写入是**异步刷新**的：save 成功立刻返回，索引在后台增量更新。
-刚写完立刻 search 可能搜不到——这不代表没写进去，响应里的 `path` 就是凭据。
-
-### `list-sources()`
-
-列出全部 source：`name`、`writable`、`available`、`unavailable_reason`
-（`disk_offline` / `dir_missing`）、`doc_count`、`description`。
-**不返回目录路径。** 写入目标必须从这里的返回选择（`writable: true` 才能写）。
-
-### `recent(limit=10, source="")`
-
-最近更新的文档，按时间倒序，每个文件一条。`edited_by` 区分：
-
-- `agent` — 最后一次修改经 `save` 写入
-- `scan` — 扫描发现的改动（人改的、别的设备或程序改的，不做推断）
-
-绕过本服务的改动要等下一次轮询或 reindex 后才出现。
+- `path` 全部与 `search` / `recent` 返回值同形（含一级分类，不含 source 名，
+  `.md` 后缀可带可不带）——原样复制，不要自行拼接
+- 写入类工具创建路径：一级分类 + 文件名走同一套字符白名单，`..`、`\ / : * ? " < > |`
+  与 Windows 保留名在语法层拒绝——不可能拼出 source 目录之外的落盘点
+- 写入是**异步刷新**的：工具立刻返回，索引后台更新，可能几秒搜不到——响应里的
+  `path` 就是凭据，不要重试
+- 写入目标必须 `writable: true`；只读、掉盘、目录不存在一律拒绝
+- **写入只有 MCP 工具**，REST 端点全为只读
 
 ---
 
@@ -211,9 +175,10 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
   "sources": [
     {"name": "memory",  "dir": "D:\\memories",              "writable": true,  "description": "个人记忆"},
     {"name": "team",    "dir": "\\\\server\\share\\team",    "writable": true,  "description": "团队共享记忆"},
-    {"name": "company", "dir": "Z:\\company\\docs",          "writable": false, "description": "公司制度文档"}
+    {"name": "org",     "dir": "Z:\\org\\docs",             "writable": false, "description": "制度文档"}
   ],
-  "domain_terms": ["RFC9424", "AES-GCM"]
+  "domain_terms": ["RFC9424", "AES-GCM"],
+  "allow_mcp_delete": false
 }
 ```
 
@@ -231,6 +196,7 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 | `max_create_chars` | `100000` | 单条记忆正文上限 |
 | `max_cached_docs` | `1000` | 常驻内存的全文篇数上限（LRU）；`0` 不限 |
 | `domain_terms` | `[]` | 领域术语词表，见下 |
+| `allow_mcp_delete` | `false` | **AI 删除断路器**：`true` 时 `delete` 与 `merge`（删源）才对 AI 开放，关闭时两个工具不出现在工具列表 |
 
 **source**：`name` + `dir`（+ 可选 `writable`、`description`、`type`）。
 
@@ -266,6 +232,7 @@ python3 config.py source edit   <名称> [--dir <新目录>] [--name <新名称>
 python3 config.py source remove <名称> [--yes] [--restart]
 python3 config.py config set poll_interval <秒> [--restart]
 python3 config.py config set max_cached_docs <篇> [--restart]
+python3 config.py config set allow_mcp_delete <true|false> [--restart]   # AI 删除开关，默认 false
 python3 config.py reindex [--full]        # 立即增量刷新（--full 全量），不用重启
 python3 config.py restart                 # 调用 run.py --restart
 ```
@@ -333,6 +300,14 @@ claude mcp add myMemory --scope user `
    先把 `host` 改为 `0.0.0.0` 再放行端口。**本服务可写且免鉴权**，请确认网络可信。
 4. **开机自启**：任务计划程序创建任务，程序 `python3`，
    参数 `"<仓库目录>\run.py" --background`，起始位置设为仓库目录。
+
+---
+
+## 更新记录
+
+各版本变化见 [CHANGELOG.md](CHANGELOG.md)：0.1.0（首个正式版本：多 source、
+可写面收敛、config.json + CLI、索引缓存与增量更新）与 0.2.0（写入面扩展
+rename / replace / merge / delete 与删除断路器 `allow_mcp_delete`）。
 
 ---
 

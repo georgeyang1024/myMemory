@@ -1,9 +1,11 @@
 # myMemory — 架构设计
 
-> 人与 AI 共同记忆的 MCP 检索与写入服务（多 source），版本 **0.1.0**
+> 人与 AI 共同记忆的 MCP 检索与写入服务（多 source），版本 **0.2.0**
 > 状态：已实施并验证通过（2026-09-02 首版检索服务；2026-09-17 改造为可写的个人记忆库；
 > 2026-09-24 0.1.0：多 source、writable 字段、config.json + config.py、最近编辑列表、
-> 索引缓存与增量更新、挂载盘掉线处理、工具短名、单平台运行。需求见 [REQUIREMENTS](REQUIREMENTS.md)）
+> 索引缓存与增量更新、挂载盘掉线处理、工具短名、单平台运行。
+> 2026-09-27 0.2.0：写入面扩展 rename / replace / merge / delete + 删除断路器 allow_mcp_delete。
+> 需求见 [REQUIREMENTS](REQUIREMENTS.md)）
 
 > **本文档描述现状。** 本项目的由来、以及为什么 ADR-0002/0004/0011/0012 里
 > 还留着另一个语料的实测数字，见 [ADR-0000](adr/0000-lineage.md)。
@@ -14,7 +16,7 @@
 
 ### 目标
 
-把若干记忆目录（**source**：个人、团队、公司……）变成一个**局域网内、免鉴权、
+把若干记忆目录（**source**：个人、团队、组织……）变成一个**局域网内、免鉴权、
 HTTP 可访问的 MCP 服务**，让任意 LLM Agent（Claude Code、Codex 等）能够：
 
 1. 跨 source 检索并按需读取已有记忆；
@@ -101,7 +103,7 @@ source 名、分类名与文件名都参与分词（[ADR-0012](adr/0012-path-and
 
 ---
 
-## 4. 组件结构
+## 4. 模块结构
 
 ```
                     局域网客户端                                  人（本机）
@@ -152,10 +154,10 @@ source 名、分类名与文件名都参与分词（[ADR-0012](adr/0012-path-and
 | 模块 | 职责 | 不做什么 |
 |---|---|---|
 | `src/config.py` | 读 config.json，校验并构造不可变配置；source 规则（含 `writable`）；字符白名单；`domain_terms` 词表。仅标准库，根目录 CLI config.py 与 run.py 复用 | 不检查目录是否存在 |
-| `storage.py` | 存储接口与 `LocalStorage`：可用性探测（Windows 探盘根；Linux 带 3 秒超时的 `ls`，超时不等遗留子进程、其退出前不再起新探测）、列文件、读、写；只读与目录不存在的最后一道闸 | 不认识索引；`iter_files`/`read_text` 无超时，hard mount 途中掉盘仍可能阻塞扫描 |
+| `storage.py` | 存储接口与 `LocalStorage`：可用性探测（Windows 探盘根；Linux 带 3 秒超时的 `ls`，超时不等遗留子进程、其退出前不再起新探测）、列文件、读、写、移动（`move`）、删除（`remove`）；只读与目录不存在的最后一道闸 | 不认识索引；`iter_files`/`read_text` 无超时，hard mount 途中掉盘仍可能阻塞扫描 |
 | `corpus.py` | DocMeta / Chunk 数据形态、固定窗口切块 | 不碰磁盘，不认识 BM25 |
 | `index.py` | jieba 分词、按文件增量刷新、掉盘保留、BM25、索引缓存读写、查询打分、轮询、快照原子替换 | 不认识 HTTP，不做参数校验 |
-| `writer.py` | **唯一的记忆写入路径**：source/分类/文件名校验、只读与可用性拒写、落盘 | 不认识索引，不认识 HTTP |
+| `writer.py` | **唯一写磁盘的边界**：source/分类/文件名校验、只读与可用性拒写、落盘；`rename_memory` / `replace_memory` / `merge_memory` / `delete_memory` 同边界，删除类受 `allow_mcp_delete` 闸 | 不认识索引，不认识 HTTP |
 | `server.py` | MCP 工具、REST 端点、有效 `writable` 计算、入参校验、响应裁剪 | 不做检索逻辑，不做落盘逻辑 |
 | `src/main.py` | 组装：读配置 → 探测可用性并警告 → 加载缓存或全量构建 → 启动轮询 → 起传输层 | 不含业务逻辑 |
 | `run.py` | 启动入口：`.venv`、依赖、前台/后台启停；向子进程钉死绝对 `MEMORY_CONFIG` | 不管配置内容 |
@@ -206,7 +208,7 @@ POST /reindex[?full=1]（config.py reindex [--full]）
 
 ## 6. 对外契约
 
-版本 **0.1.0**。完整字段见 [REQUIREMENTS](REQUIREMENTS.md) §6。
+版本 **0.2.0**。完整字段见 [REQUIREMENTS](REQUIREMENTS.md) §6。
 工具名不带前缀，客户端全名形如 `mcp__myMemory__save`。
 
 **有效可写 `writable`** = 配置 `writable` 为 true **且** 存储为 local **且** source 当前可用。
@@ -219,9 +221,9 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 ```json
 {
   "index": {"built_at": "2026-09-24T10:30:00+08:00", "doc_count": 42, "chunk_count": 310},
-  "query": "BLE 配对流程", "source": null, "total_matched": 12, "returned": 5,
+  "query": "技术选型记录", "source": null, "total_matched": 12, "returned": 5,
   "results": [
-    {"source": "team", "path": "技术/BLE配对流程.md", "writable": true, "score": 18.42,
+    {"source": "team", "path": "技术/技术选型.md", "writable": true, "score": 18.42,
      "chunk_index": 3, "char_start": 2040, "char_end": 2840,
      "snippet": "…", "snippet_truncated": false}
   ]
@@ -242,18 +244,43 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 `source` 必填、无默认值，必须有效可写；否则返回 `{"saved": false, "error", "writable_sources"}`，
 且不会重建被删除的目录。`category` 可为空。同路径整篇覆盖；成功后记 agent 标记并异步增量刷新。
 
-### 6.4 `list-sources()`
+### 6.4 `rename(source, old_path, new_path)`
+
+同 source 内改名或移动一级分类。旧文件必须真实存在（按文件系统判断，不认识索引），
+**目标存在即拒绝**——rename 的覆盖等于把已有文件直接删掉。路径与 search 返回的
+`path` 同形、`.md` 后缀可带可不带，同走文件名白名单。成功响应
+`{"renamed": true, "source", "old_path", "path", "index_refresh"}`，新 path 记 agent 标记。
+
+### 6.5 `replace(source, path, old_string, new_string)`
+
+全文**完全字面**替换（无正则、无大小写折叠、不归一化换行），全部命中处替换，
+返回 `replaced_count`。命中 0 处、`new_string` 为空、old==new 一律拒绝且不动文件。
+成功响应带替换后全文长度 `char_count`。
+
+### 6.6 `merge(source, from_path, to_path)` —— `allow_mcp_delete` 控制
+
+把**已存在**的 `from_path` 并入**已存在**的 `to_path`（目标不存在即拒绝，新建用 save），
+然后**删除源文件**。并入段以 `## 源文件相对路径` 起头、前有 `---` 分隔线（来源可追溯）。
+先写目标后删源：删除失败不回滚，响应里的 `source_removed: false` 如实标出。
+
+### 6.7 `delete(source, path)` —— `allow_mcp_delete` 控制
+
+真删（`unlink`，无备份、不可恢复）。断路器 `allow_mcp_delete` 默认关闭：
+关闭时 **6.6 / 6.7 两个工具连注册都不注册**，对 AI 完全不可见；writer 层
+（`_require_delete_enabled`）再用同一开关兜一道运行时闸。
+
+### 6.8 `list-sources()`
 
 `{"sources": [{"name", "writable", "available", "unavailable_reason", "doc_count", "description"}]}`，
 **不含目录路径**。MCP instructions 保持静态，只写规则，不列具体名称。
 
-### 6.5 `recent(limit=10, source="")`
+### 6.9 `recent(limit=10, source="")`
 
 默认 10、最多 20 条，按文件 mtime 倒序，每文件一条：
 `{"source", "path", "writable", "updated_at", "size", "edited_by": "agent" | "scan"}`。
 `edited_by` 由条目的 `agent_mtime` 判定（[ADR-0018](adr/0018-edited-by-via-status-file.md)）。
 
-### 6.6 REST 端点
+### 6.10 REST 端点
 
 | 端点 | 用途 |
 |---|---|
@@ -271,7 +298,7 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 配置不存在时在终端**交互式建档**（ADR-0025）：询问记忆目录，生成默认值 + source `memory`
 （描述"默认记忆源"）；无法交互（stdio、后台）时报错"未指定记忆存储"。
 修改一律**重启生效**。人可直接编辑，或用 `config.py`（source 增删改含 `--readonly` / `--writable`、
-`poll_interval`）。字段与默认值见 README「配置」一节。
+`config set poll_interval` / `max_cached_docs` / `allow_mcp_delete`）。字段与默认值见 README「配置」一节。
 
 `index.cache` 与 config.json 同目录，带格式版本与配置指纹（切块参数、扩展名、词典、版本）。
 
@@ -302,7 +329,9 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 - **只读**：`writable: false` 时 writer 拒绝，storage 层落盘前再拦一次；非 local 存储一律按只读
 - **可用性**：掉盘或目录不存在时拒写；storage 层绝不用 `mkdir(parents=True)` 重建被删除的 source 目录
 - **分类名与文件名是标识符**：白名单不含 `/` 与 `\`，`..`、首尾 `.`、Windows 保留名另行禁止
-- 同路径整篇覆盖，不可撤销、无备份；空正文一律拒绝；不存在删除、改名或移动文件的代码路径
+- 同路径整篇覆盖，不可撤销、无备份；空正文一律拒绝
+- **删除是断路器保护的能力**：`allow_mcp_delete`（config.json，默认 `false`，重启生效）。
+  关闭时 `delete` 与 `merge`（删源）不注册、写层同开关再拦；开启后真删，无备份
 
 详见 [ADR-0014](adr/0014-write-tool-boundary.md) 与 [ADR-0022](adr/0022-writable-field.md)。
 
@@ -354,6 +383,7 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | 12 | 依赖 `mcp` SDK 2.x API | SDK 破坏性升级会导致服务失效 | `requirements.txt` 锁死精确版本号 | [ADR-0011](adr/0011-pinned-deps-both-platforms.md) |
 | 13 | 记忆文件写入非原子（直接 `write_text`） | 落盘途中崩溃/断电会留下半截文件并被下一轮索引进去；config.json 与 index.cache 均为原子写，唯独正文没有 | 写入窗口极短；真在意的内容进版本库 | 暂不处理（2026-09-26 审查标记为已知） |
 | 14 | 首轮构建时扫描失败但盘根可访问 | 该 source 被标为"可用"却没有任何条目，直到下一轮刷新 | 首次启动的短暂窗口，能自愈 | 暂不处理（2026-09-26 审查标记为已知） |
+| 15 | `allow_mcp_delete` 开启后：真删、无备份 | 免鉴权下任意局域网调用方可删可并（删源）；融合成一堆错误记忆只在 merge 时发生 | 开关默认关、人工控制、重启生效；真在意的内容进版本库 | [ADR-0014](adr/0014-write-tool-boundary.md)（2026-09-27 修订） |
 
 ---
 
@@ -361,13 +391,13 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 
 | ADR | 标题 | 结论 |
 |---|---|---|
-| [0000](adr/0000-lineage.md) | 项目由来 | 由 `ble-sec-kb` 改造而来 |
+| [0000](adr/0000-lineage.md) | 项目由来 | 由团队知识库服务（前身项目）改造而来 |
 | [0001](adr/0001-corpus-scope.md) | 记忆边界 | 独立的 `memory/`（已被 0015 取代） |
 | [0002](adr/0002-bm25-over-vectors.md) | 检索内核 | BM25 + jieba，不引入向量 |
 | [0003](adr/0003-evidence-not-answers.md) | 服务语义 | 纯检索返回证据 |
 | [0004](adr/0004-md-txt-only.md) | 文件类型 | 仅 .md/.txt |
 | [0005](adr/0005-fixed-window-chunking.md) | 切块策略 | 统一固定窗口 800/120 |
-| [0006](adr/0006-two-tool-surface.md) | 工具面 | 最小工具面（现为 5 个），工具名不带前缀 |
+| [0006](adr/0006-two-tool-surface.md) | 工具面 | 最小工具面（现为 9 个：常驻 7 + `allow_mcp_delete` 控制 2），工具名不带前缀 |
 | [0007](adr/0007-in-memory-index-with-polling.md) | 索引生命周期 | 全内存快照 + 轮询 + 原子替换（持久化部分被 0019 取代） |
 | [0008](adr/0008-machine-agnostic-delivery.md) | 交付边界 | 只交付源码，不含部署 |
 | [0009](adr/0009-official-sdk-streamable-http.md) | 实现栈 | 官方 SDK + Streamable HTTP + REST 端点 |
