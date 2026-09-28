@@ -1,10 +1,11 @@
 # myMemory — 架构设计
 
-> 人与 AI 共同记忆的 MCP 检索与写入服务（多 source），版本 **0.2.0**
+> 人与 AI 共同记忆的 MCP 检索与写入服务（多 source），版本 **0.3.0**
 > 状态：已实施并验证通过（2026-09-02 首版检索服务；2026-09-17 改造为可写的个人记忆库；
 > 2026-09-24 0.1.0：多 source、writable 字段、config.json + config.py、最近编辑列表、
 > 索引缓存与增量更新、挂载盘掉线处理、工具短名、单平台运行。
 > 2026-09-27 0.2.0：写入面扩展 rename / replace / merge / delete + 删除断路器 allow_mcp_delete。
+> 2026-09-28 0.3.0：刷新只填全文 LRU 空位；冷启动指纹不符时抢救掉盘 source、沿用 agent 标记；指纹去掉代码版本号。
 > 需求见 [REQUIREMENTS](REQUIREMENTS.md)）
 
 > **本文档描述现状。** 本项目的由来、以及为什么 ADR-0002/0004/0011/0012 里
@@ -202,13 +203,13 @@ POST /reindex[?full=1]（config.py reindex [--full]）
 先写临时文件再原子替换。
 
 **失败策略**：刷新抛异常时**保留旧快照不替换**，记录 ERROR 日志，下一轮重试，并**务必复位
-`_rebuilding` 标志**。缓存缺失、损坏或指纹不符时告警并全量构建，不阻断服务。
+`_rebuilding` 标志**。缓存缺失、损坏或指纹不符时告警并全量构建，不阻断服务；指纹不符时沿用旧缓存的 agent 标记，并抢救掉盘 source 的条目与全文（[ADR-0026](adr/0026-offline-content-natural-lru-and-cold-start-rescue.md)）。
 
 ---
 
 ## 6. 对外契约
 
-版本 **0.2.0**。完整字段见 [REQUIREMENTS](REQUIREMENTS.md) §6。
+版本 **0.3.0**。完整字段见 [REQUIREMENTS](REQUIREMENTS.md) §6。
 工具名不带前缀，客户端全名形如 `mcp__myMemory__save`。
 
 **有效可写 `writable`** = 配置 `writable` 为 true **且** 存储为 local **且** source 当前可用。
@@ -300,7 +301,7 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 修改一律**重启生效**。人可直接编辑，或用 `config.py`（source 增删改含 `--readonly` / `--writable`、
 `config set poll_interval` / `max_cached_docs` / `allow_mcp_delete`）。字段与默认值见 README「配置」一节。
 
-`index.cache` 与 config.json 同目录，带格式版本与配置指纹（切块参数、扩展名、词典、版本）。
+`index.cache` 与 config.json 同目录，带格式版本与配置指纹（切块参数、扩展名、词典、jieba 版本；不含代码版本号，升版本不作废缓存。改了切块或分词逻辑而配置没变时须递增 `CACHE_FORMAT`）。
 
 `run.py` 解析出绝对路径后通过 `MEMORY_CONFIG` 传给子进程——后台模式的子进程工作目录是 `mcp/`。
 
@@ -375,6 +376,7 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | 5 | 掉盘时内容来自缓存 | 可能不是磁盘上的最新版本 | `get-document` 的 `stale`、`available: false` | [ADR-0020](adr/0020-mounted-disk-offline.md) |
 | 6 | 目录不存在只警告 | config.json 路径拼错不会让启动失败 | CLI 添加时校验；`/health` 的 `dir_missing` | [ADR-0020](adr/0020-mounted-disk-offline.md) |
 | 7a | 全文缓存上限 `max_cached_docs`（默认 1000，LRU） | 不在缓存里的全文与片段要现场读盘（网络盘慢一点）；掉盘时读不到 | 所有文档照常可检索；缓存随 index.cache 持久化 | [ADR-0024](adr/0024-max-cached-docs.md) |
+| 7b | 刷新只填全文 LRU 空位、不挤人 | 刷新后第一次读到没被缓存的在线文件要读一次盘 | 掉盘全文只会被真实读取自然淘汰；LRU 保留的是真实用过的文档 | [ADR-0026](adr/0026-offline-content-natural-lru-and-cold-start-rescue.md) |
 | 7 | 缓存约 80 MB / 1500 文件，常驻内存随之增加 | 磁盘与内存占用 | 分词结果驻留（`sys.intern`）；缓存可随时删除重建 | [ADR-0019](adr/0019-index-cache-incremental.md) |
 | 8 | agent 标记在缓存写回前只在内存 | save 后到下一次缓存写回之间崩溃会丢这一条标记 | save 立即触发刷新，窗口只有数秒 | [ADR-0018](adr/0018-edited-by-via-status-file.md) |
 | 9 | 多个 stdio 进程共用一份缓存 | 最后写回者生效，别人的 agent 标记可能被覆盖 | 需要准确时用 HTTP 共享一个实例 | [ADR-0019](adr/0019-index-cache-incremental.md) |
@@ -416,5 +418,6 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | [0022](adr/0022-writable-field.md) | 只读 | 配置字段 `writable`，输出带有效可写 |
 | [0023](adr/0023-rename-workspace-to-source.md) | 术语 | workspace 更名为 source |
 | [0024](adr/0024-max-cached-docs.md) | 内存上限 | 常驻内存的全文最多 max_cached_docs 篇（LRU） |
+| [0026](adr/0026-offline-content-natural-lru-and-cold-start-rescue.md) | 掉盘与缓存 | 刷新只填 LRU 空位；冷启动指纹不符时抢救掉盘 source；指纹去掉版本号 |
 
 术语定义见 [GLOSSARY.md](GLOSSARY.md)。

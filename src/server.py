@@ -64,7 +64,6 @@ BM25 匹配，不做同义改写：搜不到就换记忆里实际写过的词。
 
 GET_DOCUMENT_DESCRIPTION = """\
 按 source + path 读一篇原文，支持字符分页（默认与上限 40000）。
-source 与 path 必须原样复制自 search/recent 的返回值，不要自行拼接。
 不在索引中会被拒并给出相近候选；掉盘时 stale: true（可能不是最新）。\
 """
 
@@ -88,20 +87,20 @@ edited_by 区分 agent（经 save 写入）/ scan（扫描发现改动，可能�
 
 RENAME_DESCRIPTION = """\
 给一篇记忆改名或移到另一个一级分类（同一个 source 内）。目标已存在即拒绝，不覆盖。
-old_path / new_path 原样取自 search/recent 的 path（.md 可带可不带），不含 source 名。
 新文件名要与现有文件不同名，否则会被拒；改名成功后旧 path 不再存在。\
 """
 
 REPLACE_DESCRIPTION = """\
 在一篇记忆的全文里做字面替换 old_string → new_string，命中几处换几处，返回替换次数。
 完全字面匹配：空格与换行必须逐字一致，不做正则、不做大小写折叠、不归一化换行。
-old_string 命中 0 处或 new_string 为空都会被拒绝且不改动文件；整篇重写请改用 save。\
+old_string 命中 0 处或 new_string 为空都会被拒绝且不改动文件；整篇重写请改用 save。
+path 支持多层目录的文件编辑（编辑的文件必须已存在）。\
 """
 
 MERGE_DESCRIPTION = """\
 把一篇记忆并入另一篇已存在的记忆（同一个 source 内），然后删除源文件。
 并入段以 ## 源文件路径 为标题、前有 --- 分隔线，来源可追溯。
-from_path 与 to_path 都原样取自 search/recent 的 path；目标必须已存在，新建用 save。\
+目标必须已存在，新建用 save。\
 """
 
 DELETE_DESCRIPTION = """\
@@ -605,7 +604,8 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         ))],
         path: Annotated[str, Field(description=(
             "文件路径，原样复制自 search/recent 返回的 path，"
-            "不含 source 名，.md 后缀可带可不带。"
+            "不含 source 名，.md 后缀可带可不带。支持多层目录的文件，"
+            "须已存在（先 search 确认）。"
         ))],
         old_string: Annotated[str, Field(description=(
             "要被替换的原文片段，必须逐字一致，建议连同少量上下文保证唯一。"
@@ -648,11 +648,11 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         )
         def tool_delete(
             source: Annotated[str, Field(description=(
-                "必填。文件所在的 source，必须可写（list-sources里writable为true）"
+                "必填。文件所在的 source，必须可写（list-sources 里 writable 为 true）。"
             ))],
             path: Annotated[str, Field(description=(
-                "文件路径，路径自search或recent返回的path，"
-                "不含source名，.md 后缀可带可不带。"
+                "文件路径，原样复制自 search/recent 返回的 path，"
+                "不含 source 名，.md 后缀可带可不带。"
             ))],
         ) -> str:
             payload = run_delete(config, holder, source, path)

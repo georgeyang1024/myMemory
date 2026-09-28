@@ -30,11 +30,11 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 
 import jieba
 from rank_bm25 import BM25Okapi
 
-from version import __version__
 from config import Config
 from corpus import Chunk, DocKey, DocMeta, split_text
 from storage import AVAILABLE, DISK_OFFLINE, Availability, open_storage
@@ -136,6 +136,18 @@ class ContentCache:
             if self.capacity > 0:
                 while len(self._items) > self.capacity:
                     self._items.popitem(last=False)
+
+    def offer(self, key: DocKey, version: tuple[float, int], text: str) -> None:
+        """刷新用：只填空位、不挤人（docs/adr/0026）。
+
+        刷新是后台维护，不算使用：key 已在缓存里就原地更新、不移动位置；
+        有空位才放到末尾；满了就不放——免得整批灌入挤掉掉盘 source 读不回来的全文。
+        """
+        with self._lock:
+            if key in self._items:
+                self._items[key] = (version, text)
+            elif self.capacity <= 0 or len(self._items) < self.capacity:
+                self._items[key] = (version, text)
 
     def retain(self, entries: dict[DocKey, "FileEntry"]) -> None:
         """只保留仍在索引里、且版本一致的全文。"""
@@ -479,7 +491,7 @@ def refresh(
       待并入的 agent 标记替换进沿用条目（下同）——否则标记会被当成已消费而丢掉。
     - 目录不存在（盘在）：按删除处理，该 source 的条目全部移除。
     - 不在配置里的 source：条目移除。
-    - 新读进来的全文放进 cache（容量受 max_cached_docs 限制，LRU）。
+    - 新读进来的全文 offer 给 cache：只填空位、不挤人，不改变 LRU 顺序（docs/adr/0026）。
     """
     marks = agent_marks or {}
     extensions = set(config.extensions)
@@ -536,7 +548,7 @@ def refresh(
                 entry = _make_entry(config, source.name, stat.path, stat.mtime, stat.size,
                                     content, agent_mtime)
                 if cache is not None:
-                    cache.put(key, entry.version, content)
+                    cache.offer(key, entry.version, content)
             entries[key] = entry
 
     return entries, availability
@@ -546,11 +558,17 @@ def open_storages(config: Config) -> dict[str, object]:
     return {src.name: open_storage(src) for src in config.sources}
 
 
-def build(config: Config, cache: ContentCache | None = None) -> IndexSnapshot:
-    """不借助 index.cache 的全量构建。用于自检、无缓存启动与测试。"""
+def build(config: Config, cache: ContentCache | None = None,
+          rescue: dict | None = None) -> IndexSnapshot:
+    """不借助 index.cache 的全量构建。用于自检、无缓存启动与测试。
+
+    rescue：指纹不符的旧缓存载荷（见 read_cache）。给了就从中沿用 agent 标记，
+    并抢救掉盘 source 的条目与全文（docs/adr/0026）。
+    """
     started = time.perf_counter()
     cache = ContentCache(config.max_cached_docs) if cache is None else cache
-    entries, availability = refresh(config, {}, full=True, cache=cache)
+    previous = _rescue_previous(config, rescue, cache) if rescue is not None else {}
+    entries, availability = refresh(config, previous, full=True, cache=cache)
     cache.retain(entries)
     snapshot = IndexSnapshot(entries=entries, availability=availability, cache=cache,
                              storages=open_storages(config),
@@ -562,13 +580,58 @@ def build(config: Config, cache: ContentCache | None = None) -> IndexSnapshot:
     return snapshot
 
 
+def _rescue_previous(config: Config, payload: dict, cache: ContentCache) -> dict[DocKey, FileEntry]:
+    """从指纹不符的旧缓存里挑出还能用的旧条目，作为全量 refresh 的 previous。
+
+    - 在线 source：旧条目只用来沿用 agent_mtime——full 一律重读、重分词；
+    - 掉盘 source：refresh 会原样沿用，所以先在这里处理好：
+      旧缓存有全文（版本一致）的按新配置重新切块分词，全文按旧的使用顺序放回 cache；
+      没有全文的沿用旧分词（能搜到，片段为空），盘恢复后等被动更新；
+      扩展名已不在当前配置里的丢弃。
+    """
+    names = {src.name for src in config.sources}
+    offline = {src.name for src in config.sources
+               if open_storage(src).probe().reason == DISK_OFFLINE}
+    extensions = set(config.extensions)
+    contents = payload.get("contents") or []
+    texts = {key: (version, text) for key, version, text in contents}
+
+    previous: dict[DocKey, FileEntry] = {}
+    retokenized = kept = 0
+    for entry in payload["entries"]:
+        if entry.source not in names:
+            continue
+        if entry.source in offline:
+            if PurePosixPath(entry.path).suffix.lower() not in extensions:
+                continue
+            cached = texts.get(entry.key)
+            if cached is not None and cached[0] == entry.version:
+                entry = _make_entry(config, entry.source, entry.path, entry.mtime, entry.size,
+                                    cached[1], entry.agent_mtime)
+                retokenized += 1
+            else:
+                kept += 1
+        previous[entry.key] = entry
+
+    cache.load(item for item in contents
+               if item[0][0] in offline and item[0] in previous
+               and previous[item[0]].version == item[1])
+    if offline:
+        logger.warning("从旧缓存抢救掉盘 source %s：%d 篇按新配置重新分词，%d 篇沿用旧分词（无全文）",
+                       "、".join(sorted(offline)), retokenized, kept)
+    return previous
+
+
 # --- 索引缓存 -----------------------------------------------------------------
 
 def cache_fingerprint(config: Config) -> str:
-    """配置指纹：影响切块或分词的任何东西变了，缓存就作废。"""
+    """配置指纹：影响切块或分词的任何东西变了，缓存就作废。
+
+    不含代码版本号：升版本不作废缓存（docs/adr/0026）。改了切块或分词逻辑而配置没变时，
+    必须手动递增 CACHE_FORMAT。
+    """
     basis = {
         "format": CACHE_FORMAT,
-        "version": __version__,
         "chunk_size": config.chunk_size,
         "chunk_overlap": config.chunk_overlap,
         "extensions": sorted(config.extensions),
@@ -599,33 +662,49 @@ def save_cache(config: Config, snapshot: IndexSnapshot) -> None:
         logger.warning("索引缓存写入失败 %s：%s", path, exc)
 
 
-def load_cache(config: Config, cache: ContentCache | None = None) -> IndexSnapshot | None:
-    """读取缓存并直接构成快照。缺失、损坏、格式或指纹不符时返回 None 并告警。
+def read_cache(config: Config) -> tuple[dict | None, bool]:
+    """读取缓存载荷，返回 (载荷, 指纹是否一致)。
 
-    配置里已删除的 source 的条目在这里丢弃；可用性只做一次廉价的盘根/目录探测，
-    真正的内容校验交给随后的后台增量更新。
+    缺失、损坏、格式不符 → (None, False)：结构不可信，什么都不能用。
+    指纹不符 → (载荷, False)：结构可信，只是切块或分词可能过时，可供 build 抢救。
     """
     path = config.cache_file
     if not path.exists():
         logger.info("没有索引缓存（%s），将全量构建", path)
-        return None
-    started = time.perf_counter()
+        return None, False
     try:
         with open(path, "rb") as f:
             payload = pickle.load(f)
         if payload.get("format") != CACHE_FORMAT:
             logger.warning("索引缓存格式版本不符，将全量构建")
-            return None
-        if payload.get("fingerprint") != cache_fingerprint(config):
-            logger.warning("索引缓存的配置指纹不符（切块、扩展名、词典或版本变了），将全量构建")
-            return None
-        stored: list[FileEntry] = payload["entries"]
-        bm25 = payload.get("bm25")
-        cached_contents = payload.get("contents") or []
+            return None, False
+        payload["entries"]  # noqa: B018  结构检查：缺字段按损坏处理
     except Exception as exc:  # noqa: BLE001  损坏的 pickle 可能抛出任意异常
         logger.warning("索引缓存无法读取或已损坏（%s），将全量构建", exc)
-        return None
+        return None, False
+    if payload.get("fingerprint") != cache_fingerprint(config):
+        logger.warning("索引缓存的配置指纹不符（切块、扩展名或词典变了），将全量构建并抢救掉盘 source")
+        return payload, False
+    return payload, True
 
+
+def load_cache(config: Config, cache: ContentCache | None = None) -> IndexSnapshot | None:
+    """读取缓存并直接构成快照。缺失、损坏、格式或指纹不符时返回 None 并告警。"""
+    started = time.perf_counter()
+    payload, fresh = read_cache(config)
+    if not fresh:
+        return None
+    return _snapshot_from_cache(config, payload, cache, started)
+
+
+def _snapshot_from_cache(config: Config, payload: dict, cache: ContentCache | None,
+                         started: float) -> IndexSnapshot:
+    """配置里已删除的 source 的条目在这里丢弃；可用性只做一次廉价的盘根/目录探测，
+    真正的内容校验交给随后的后台增量更新。
+    """
+    stored: list[FileEntry] = payload["entries"]
+    bm25 = payload.get("bm25")
+    cached_contents = payload.get("contents") or []
     names = {ws.name for ws in config.sources}
     entries = {e.key: e for e in stored if e.source in names}
     if len(entries) != len(stored):
@@ -685,20 +764,23 @@ class IndexHolder:
         """启动时用了缓存、后台校验还没完成。此刻的内容可能是上次关闭时的样子。"""
         return self._verifying
 
-    def build_now(self) -> IndexSnapshot:
-        """阻塞式全量构建并写缓存。"""
-        self._snapshot = build(self._config, self._cache)
+    def build_now(self, rescue: dict | None = None) -> IndexSnapshot:
+        """阻塞式全量构建并写缓存。rescue：指纹不符的旧缓存载荷，见 build。"""
+        self._snapshot = build(self._config, self._cache, rescue=rescue)
         save_cache(self._config, self._snapshot)
         return self._snapshot
 
     def start(self) -> IndexSnapshot:
         """启动：有可用缓存就立即用它服务并在后台增量校验；否则阻塞全量构建。
 
+        指纹不符时全量构建，但从旧缓存沿用 agent 标记、抢救掉盘 source（docs/adr/0026）。
         必须在开始监听端口之前调用，以避免出现"服务已启动但索引未就绪"的窗口。
         """
-        cached = load_cache(self._config, self._cache)
-        if cached is None:
-            return self.build_now()
+        started = time.perf_counter()
+        payload, fresh = read_cache(self._config)
+        if not fresh:
+            return self.build_now(rescue=payload)
+        cached = _snapshot_from_cache(self._config, payload, self._cache, started)
         self._snapshot = cached
         self._verifying = True
         self.request_rebuild("启动后台校验")
