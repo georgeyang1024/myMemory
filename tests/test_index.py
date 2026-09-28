@@ -627,3 +627,177 @@ def test_cached_contents_survive_restart(cache_root: Path):
     loaded = index.load_cache(config)
     after = {k for k in loaded.entries if loaded.cache.get(k, loaded.entries[k].version)}
     assert after == before and len(after) == 2
+
+
+# --- 刷新只填空位、冷启动抢救、指纹去版本号（ADR-0026）-------------------------
+
+def _wait_idle(holder: index.IndexHolder) -> None:
+    deadline = time.time() + 30
+    while time.time() < deadline and (holder.verifying or holder.rebuilding):
+        time.sleep(0.05)
+
+
+def _cached_keys(cache: index.ContentCache) -> list:
+    return [key for key, _, _ in cache.dump()]
+
+
+def test_offline_get_failure_does_not_enter_cache(cache_root: Path, monkeypatch):
+    """掉盘且不在缓存里：get 失败，不进 LRU，也不挤掉别人。"""
+    config = make_config(cache_root, max_cached_docs=1)
+    holder = index.IndexHolder(config)
+    holder.build_now()
+    _offline(monkeypatch, "memory")
+    holder.request_rebuild("掉盘")
+    _wait_idle(holder)
+    snapshot = holder.snapshot
+    before = _cached_keys(snapshot.cache)
+    uncached = next(k for k in snapshot.entries if k not in before)
+    with pytest.raises(index.ContentUnavailable):
+        snapshot.contents[uncached]
+    assert _cached_keys(snapshot.cache) == before
+
+
+def test_full_refresh_does_not_evict_offline_contents(multi_root: Path, monkeypatch):
+    """缓存已满时，全量刷新读进来的在线全文不挤掉掉盘 source 的全文。"""
+    config = multi_config(multi_root, max_cached_docs=2)
+    snapshot = index.build(config)
+    team_key = ("team", "机制.md")
+    assert snapshot.contents[team_key]  # 真实使用：确保在缓存里
+    _offline(monkeypatch, "team")
+
+    index.refresh(config, snapshot.entries, full=True, cache=snapshot.cache)
+    assert team_key in _cached_keys(snapshot.cache), "掉盘全文被刷新挤掉了"
+    assert len(snapshot.cache) == 2
+
+
+def test_refresh_does_not_reorder_lru(cache_root: Path):
+    """刷新不算使用：不改变 LRU 顺序，也不在已满时放入新全文。"""
+    config = make_config(cache_root, max_cached_docs=2)
+    snapshot = index.build(config)
+    first, second = _cached_keys(snapshot.cache)
+    snapshot.contents[first]  # 使用 first，使它成为最近使用
+    order = _cached_keys(snapshot.cache)
+    assert order == [second, first]
+
+    index.refresh(config, snapshot.entries, full=True, cache=snapshot.cache)
+    assert _cached_keys(snapshot.cache) == order
+
+
+def test_refresh_updates_cached_content_in_place(cache_root: Path):
+    config = make_config(cache_root, max_cached_docs=2)
+    snapshot = index.build(config)
+    order = _cached_keys(snapshot.cache)
+    source, path = order[0]
+    target = cache_root / "memory" / path
+    target.write_text("SecProto 改过的正文，长度也变了", encoding="utf-8")
+
+    entries, _ = index.refresh(config, snapshot.entries, cache=snapshot.cache)
+    assert _cached_keys(snapshot.cache) == order, "原地更新，不移动位置"
+    # get 命中算使用、会移动位置，所以放在顺序断言之后
+    assert snapshot.cache.get((source, path), entries[(source, path)].version) == \
+        "SecProto 改过的正文，长度也变了"
+
+
+def test_cache_fingerprint_ignores_code_version(kb_root: Path, monkeypatch):
+    config = make_config(kb_root)
+    before = index.cache_fingerprint(config)
+    monkeypatch.setattr(index, "__version__", "9.9.9", raising=False)
+    assert index.cache_fingerprint(config) == before, "升版本号不应作废缓存"
+
+
+@pytest.fixture
+def rescue_root(multi_root: Path) -> Path:
+    """team 的正文足够长，切块参数一变块偏移就不同。"""
+    (multi_root / "team" / "机制.md").write_text("团队规范：SecProto 机制流程。" * 100,
+                                                encoding="utf-8")
+    (multi_root / "team" / "附录.txt").write_text("团队附录：SecProto 名词表。", encoding="utf-8")
+    return multi_root
+
+
+def test_cold_start_rescues_offline_entries_with_content(rescue_root: Path, monkeypatch):
+    """指纹不符 + 掉盘：有全文的掉盘条目按新配置重新切块分词，可搜、可读。"""
+    index.IndexHolder(multi_config(rescue_root)).build_now()
+    _offline(monkeypatch, "team")
+    config = multi_config(rescue_root, chunk_size=300)  # 指纹变化
+
+    holder = index.IndexHolder(config)
+    snapshot = holder.start()
+    _wait_idle(holder)
+    snapshot = holder.snapshot
+    key = ("team", "机制.md")
+    text = "团队规范：SecProto 机制流程。" * 100
+    assert key in snapshot.entries, "掉盘 source 不应在冷启动时消失"
+    entry = snapshot.entries[key]
+    expected = index._make_entry(config, "team", "机制.md", entry.mtime, entry.size, text, None)
+    assert entry.spans == expected.spans and entry.tokens == expected.tokens, "应按新配置重新切块分词"
+    assert snapshot.contents[key] == text
+    total, hits = snapshot.search("SecProto 机制", 5, source="team")
+    assert total >= 1 and all(h.text is not None for h in hits)
+
+
+def test_cold_start_keeps_offline_entries_without_content(rescue_root: Path, monkeypatch):
+    """没有全文的掉盘条目：沿用旧分词，能搜到，片段为空，读不到。"""
+    old_config = multi_config(rescue_root, max_cached_docs=1)
+    built = index.IndexHolder(old_config).build_now()
+    key = ("team", "机制.md")
+    assert built.cache.get(key, built.entries[key].version) is None, "前提：team 全文不在缓存里"
+    old_entry = built.entries[key]
+    _offline(monkeypatch, "team")
+
+    holder = index.IndexHolder(multi_config(rescue_root, max_cached_docs=1, chunk_size=300))
+    holder.start()
+    _wait_idle(holder)
+    snapshot = holder.snapshot
+    assert snapshot.entries[key].spans == old_entry.spans, "没有全文只能沿用旧分词"
+    total, hits = snapshot.search("团队规范", 5, source="team")
+    assert total >= 1 and all(h.text is None for h in hits)
+    with pytest.raises(index.ContentUnavailable):
+        snapshot.contents[key]
+
+
+def test_cold_start_rescue_drops_excluded_extensions(rescue_root: Path, monkeypatch):
+    index.IndexHolder(multi_config(rescue_root)).build_now()
+    _offline(monkeypatch, "team")
+
+    holder = index.IndexHolder(multi_config(rescue_root, extensions=[".md"]))
+    holder.start()
+    _wait_idle(holder)
+    assert ("team", "机制.md") in holder.snapshot.entries
+    assert ("team", "附录.txt") not in holder.snapshot.entries
+
+
+def test_cold_start_keeps_agent_marks(rescue_root: Path):
+    """指纹不符的冷启动：在线 source 全量重读，但 edited_by 沿用旧缓存的 agent 标记。"""
+    config = multi_config(rescue_root)
+    holder = index.IndexHolder(config)
+    holder.build_now()
+    key = ("memory", "机制.md")
+    holder.mark_agent(*key, (rescue_root / "memory" / "机制.md").stat().st_mtime)
+    holder.request_rebuild("save")
+    _wait_idle(holder)
+    assert holder.snapshot.entries[key].edited_by == "agent"
+
+    cold = index.IndexHolder(multi_config(rescue_root, chunk_size=300))
+    cold.start()
+    _wait_idle(cold)
+    assert cold.snapshot.entries[key].edited_by == "agent"
+
+
+@pytest.mark.parametrize("damage", ["garbage", "format"])
+def test_unreadable_cache_is_not_rescued(rescue_root: Path, monkeypatch, damage):
+    """格式不符或损坏：结构不可信，不抢救，掉盘 source 照旧丢失。"""
+    import pickle
+
+    config = multi_config(rescue_root)
+    index.IndexHolder(config).build_now()
+    if damage == "garbage":
+        config.cache_file.write_bytes(b"not a pickle")
+    else:
+        payload = pickle.loads(config.cache_file.read_bytes())
+        payload["format"] = "changed"
+        config.cache_file.write_bytes(pickle.dumps(payload))
+    _offline(monkeypatch, "team")
+
+    holder = index.IndexHolder(config)
+    holder.start()
+    assert not any(k[0] == "team" for k in holder.snapshot.entries)

@@ -558,18 +558,43 @@ def fetch_health(port: int, timeout: float = 2.0) -> dict | None:
         return None
 
 
+def already_serving(port: int) -> bool:
+    """端口上是否已有服务在应答 /health。
+
+    PID 文件只记得 --background 拉起的进程；前台启动的、或启动器被杀后
+    子进程被遗留的服务都没有 PID 文件，只能靠端口探活发现。
+    """
+    return fetch_health(port) is not None
+
+
 def do_status() -> int:
     port = resolve_port()
     pid = read_pid()
-    if pid is None:
-        log(f"未在后台运行（端口 {port}）")
-        return 1
-    log(f"运行中 · PID {pid} · 端口 {port}")
     health = fetch_health(port)
+    if pid is None:
+        if not health:
+            log(f"未在后台运行（端口 {port}）")
+            return 1
+        log(f"运行中 · 端口 {port}（无 PID 文件：非 --background 启动，--stop 管不到它）")
+    else:
+        log(f"运行中 · PID {pid} · 端口 {port}")
     if health:
         log(f"索引：{health.get('doc_count')} 文档 / {health.get('chunk_count')} chunk")
         log(f"重建中：{health.get('rebuilding')}")
-        log(f"记忆根目录：{health.get('root')}")
+        sources = health.get("sources")
+        if sources:
+            # 多 source：每个 source 报自己的目录与可用性；单行摘要写在最前面。
+            summary = "、".join(
+                f"{s.get('name')}：{'可用' if s.get('available') else '不可用'}"
+                for s in sources
+            )
+            log(f"记忆 source（{len(sources)} 个）：{summary}")
+            for s in sources:
+                writable = "读写" if s.get("writable") else "只读"
+                reason = s.get("unavailable_reason")
+                suffix = f"（{reason}）" if reason else ""
+                log(f"  {s.get('name')}（{writable}）→ {s.get('dir')} ："
+                    f"{s.get('doc_count')} 文档{suffix}")
     else:
         log("⚠️  进程在，但 /health 不通——可能仍在构建索引，或端口与 PID 文件不一致")
     return 0
@@ -811,6 +836,9 @@ def main() -> int:
         if existing is not None:
             log(f"已经在后台运行了 · PID {existing} · 端口 {port}")
             log("要重启用：run.py --restart")
+            return 0
+        if already_serving(port):
+            log(f"端口 {port} 上已有服务在运行（无 PID 文件，可能是前台启动的），跳过启动")
             return 0
         log(f"正在后台启动…（日志：{LOG_FILE}）")
         pid = spawn_background(command, environ)

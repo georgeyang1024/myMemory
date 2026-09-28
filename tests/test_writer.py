@@ -543,6 +543,68 @@ def test_run_replace_reports_error_without_raising(config):
     assert payload["writable_sources"] == ["memory", "team"]
 
 
+# --- replace：多层目录 -------------------------------------------------------
+
+def test_replace_supports_nested_category_when_file_exists(config):
+    """replace 只编辑已有文件，多层分类路径允许到达（文件须人工先建好）。"""
+    nested = root(config) / "技术" / "协议" / "HTTP"
+    nested.mkdir(parents=True)
+    (nested / "要点.md").write_text("HTTP 是无状态的。", encoding="utf-8")
+    written = replace_memory(config, "memory", "技术/协议/HTTP/要点.md", "是无状态", "是无状态（短连接）")
+    assert written.path == "技术/协议/HTTP/要点.md"
+    assert written.absolute == nested / "要点.md"
+    assert (nested / "要点.md").read_text(encoding="utf-8") == "HTTP 是无状态（短连接）的。"
+
+
+def test_replace_supports_deep_and_hidden_directories(config):
+    """层级不限，隐藏目录也放行——replace 只编辑人工已建好的文件。"""
+    deep = root(config) / "技术" / "知识库私有" / ".工作区" / "深" / "更深" / "底"
+    deep.mkdir(parents=True)
+    (deep / "便签.md").write_text("一句原文", encoding="utf-8")
+    written = replace_memory(config, "memory", "技术/知识库私有/.工作区/深/更深/底/便签.md",
+                             "原文", "改后")
+    assert written.created is False
+    assert (deep / "便签.md").read_text(encoding="utf-8") == "一句改后"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../外面/文件",          # 穿越段
+        "技术/../协议/文件",
+        "技术/./协议/文件",
+        "技术//协议/文件",       # 空段
+        "/技术/协议/文件",        # 首段为空
+    ],
+)
+def test_replace_rejects_illegal_nested_category(config, path):
+    with pytest.raises(WriteError):
+        replace_memory(config, "memory", path, "旧", "新")
+
+
+def test_replace_nothing_written_outside_root(config, tmp_path):
+    """穿越路径被拒绝后，记忆根目录之外不得出现任何新文件。"""
+    before = sorted(str(p) for p in tmp_path.rglob("*"))
+    for bad in ("../../外面/文件", "技术/../../外面/文件"):
+        with pytest.raises(WriteError):
+            replace_memory(config, "memory", bad, "旧", "新")
+    assert sorted(str(p) for p in tmp_path.rglob("*")) == before
+
+
+def test_replace_still_rejects_illegal_filename_stem(config):
+    """文件名主干仍走一级白名单（这块边界不在本次放宽范围）。"""
+    with pytest.raises(WriteError, match="文件名部分非法"):
+        replace_memory(config, "memory", "技术/问号?.md", "旧", "新")
+    with pytest.raises(WriteError, match="文件名部分非法"):
+        replace_memory(config, "memory", "CON.md", "旧", "新")
+
+
+def test_replace_nested_keeps_save_one_level(config):
+    """同一台机器上，save 对同样的嵌套路径仍然拒绝——只有 replace 放开。"""
+    with pytest.raises(WriteError, match="分类只有一级"):
+        save_memory(config, "memory", "技术/协议", "文件", "内容")
+
+
 # --- merge：并入目标并删源 ---------------------------------------------------
 
 def test_merge_appends_to_existing_file_with_source_heading(config):

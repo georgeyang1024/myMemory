@@ -252,6 +252,52 @@ def test_read_pid_clears_stale_file(tmp_path: Path, monkeypatch):
     assert not pid_file.exists(), "残留的 PID 文件必须被清掉"
 
 
+def test_status_detects_service_without_pid_file(monkeypatch):
+    """前台启动（或启动器被杀）的服务没有 PID 文件，但端口上 /health 通——应报告运行中。"""
+    messages: list[str] = []
+    monkeypatch.setattr(run, "log", messages.append)
+    monkeypatch.setattr(run, "resolve_port", lambda: 7083)
+    monkeypatch.setattr(run, "read_pid", lambda: None)
+    monkeypatch.setattr(run, "fetch_health", lambda port, timeout=2.0: {
+        "doc_count": 3, "chunk_count": 9, "rebuilding": False,
+        "sources": [
+            {"name": "memory", "writable": True, "available": True,
+             "unavailable_reason": None, "doc_count": 2, "dir": "/mnt/nas/memory",
+             "description": "主记忆库（NAS）"},
+            {"name": "local", "writable": False, "available": False,
+             "unavailable_reason": "目录不存在", "doc_count": 1,
+             "dir": "/tmp/other", "description": None},
+        ],
+    })
+
+    assert run.do_status() == 0
+    assert any("运行中" in m for m in messages)
+    # 每个 source 都要报出自己的目录与可用性，而不是显示一个已废弃的"根目录"。
+    assert any("/mnt/nas/memory" in m for m in messages)
+    assert any("/tmp/other" in m for m in messages)
+    assert any("目录不存在" in m for m in messages)
+
+
+def test_status_reports_stopped_when_no_pid_and_no_health(monkeypatch):
+    messages: list[str] = []
+    monkeypatch.setattr(run, "log", messages.append)
+    monkeypatch.setattr(run, "resolve_port", lambda: 7083)
+    monkeypatch.setattr(run, "read_pid", lambda: None)
+    monkeypatch.setattr(run, "fetch_health", lambda port, timeout=2.0: None)
+
+    assert run.do_status() == 1
+    assert any("未在后台运行" in m for m in messages)
+
+
+def test_background_start_skips_when_port_already_serving(monkeypatch):
+    """没有 PID 文件但服务已在端口上——--background 不能再拉起第二个实例。"""
+    monkeypatch.setattr(run, "read_pid", lambda: None)
+    monkeypatch.setattr(run, "fetch_health", lambda port, timeout=2.0: {"doc_count": 1})
+    assert run.already_serving(7083) is True
+    monkeypatch.setattr(run, "fetch_health", lambda port, timeout=2.0: None)
+    assert run.already_serving(7083) is False
+
+
 def _spawn_capturing_kwargs(tmp_path: Path, monkeypatch, *, windows: bool) -> dict:
     """跑一次 spawn_background，把传给 Popen 的参数抓出来。"""
     monkeypatch.setattr(run, "IS_WINDOWS", windows)

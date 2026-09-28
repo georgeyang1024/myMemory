@@ -32,3 +32,5 @@ ADR-0007 的地基是"全量重建只要 2–3 秒"。挂载部门知识库（�
 - ADR-0007 中"落盘只会引入不同步故障"的担忧由配置指纹 + 按文件 `(mtime, size)` 校验处理。
 - status.json 并入缓存（`agent_mtime`），见 [ADR-0018](0018-edited-by-via-status-file.md)。
 - 掉盘时缓存成为该 workspace 唯一的数据来源，见 [ADR-0020](0020-mounted-disk-offline.md)。
+
+**后续 · 2026-09-28**：指纹去掉代码版本号；指纹不符时对掉盘 source 做抢救而非直接丢弃，见 [ADR-0026](0026-offline-content-natural-lru-and-cold-start-rescue.md)。

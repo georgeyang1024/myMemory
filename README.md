@@ -3,6 +3,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+**中文** | [English](README_EN.md)
+
 **A local-first memory service for humans and AI agents.**
 人与 AI 共同使用的本机记忆库：双方都往里写、都从里读，跨会话长期保存。
 
@@ -14,7 +16,7 @@
 
 ## English overview
 
-**myMemory** is a local-first, self-hosted **long-term memory server for AI agents and humans**. Plain Markdown files are the single source of truth — no vector database, no cloud dependency, no lock-in. Agents read and write through [MCP (Model Context Protocol)](https://modelcontextprotocol.io) tools; you edit the same notes in any editor at any time, and your changes enter the search index automatically.
+**myMemory** is a local-first, self-hosted **long-term memory server for AI agents and humans**. Plain Markdown files are the single source of truth — no vector database, no cloud dependency, no lock-in. Agents read and write through [MCP (Model Context Protocol)](https://modelcontextprotocol.io) tools; you edit the same notes in any editor at any time, and your changes enter the search index automatically. For the full English README, see [`README_EN.md`](README_EN.md).
 
 - **Full-text retrieval with BM25** keyword ranking + jieba tokenization — deterministic, explainable, fully offline
 - Multiple named *sources* (personal / team / company), each a directory on local disk or a mounted volume (NAS) → one shared memory across people and devices
@@ -306,8 +308,9 @@ claude mcp add myMemory --scope user `
 ## 更新记录
 
 各版本变化见 [CHANGELOG.md](CHANGELOG.md)：0.1.0（首个正式版本：多 source、
-可写面收敛、config.json + CLI、索引缓存与增量更新）与 0.2.0（写入面扩展
-rename / replace / merge / delete 与删除断路器 `allow_mcp_delete`）。
+可写面收敛、config.json + CLI、索引缓存与增量更新）、0.2.0（写入面扩展
+rename / replace / merge / delete 与删除断路器 `allow_mcp_delete`）与
+0.3.0（掉盘 source 数据保全：缓存只填空位、冷启动抢救旧缓存、指纹去掉版本号）。
 
 ---
 

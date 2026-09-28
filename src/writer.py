@@ -16,7 +16,9 @@
    覆盖时返回 created=False 与被替换内容的长度。
 5. **rename、replace 与 merge 走同一套边界**。rename 在同 source 内改名/移一级分类，
    目标存在即拒绝（覆盖等于把已有文件直接删掉，不可撤销）；replace 做字面
-   old→new 替换，命中 0 处或 new_string 为空一律拒绝；merge 把一篇已存在的
+   old→new 替换，命中 0 处或 new_string 为空一律拒绝（replace 是四者中唯一
+   支持多层分类路径的：只编辑已存在的文件，文件须人工先建好，不限制层级、
+   允许隐藏目录，只拦路径穿越与空段）；merge 把一篇已存在的
    记忆并入另一篇并删源，并入段带来源标题。三者的源/目标文件都必须真实
    存在；不认识索引，存在性按文件系统判断。
 6. **删除是断路器保护的能力（配置 allow_mcp_delete，默认关）**。delete 真删
@@ -231,6 +233,46 @@ def _validate_location(config: Config, category: str, stem: str,
     return category, stem
 
 
+def _validate_nested_category(config: Config, category: str,
+                              which: str = "path") -> str:
+    """replace 专用的多层分类校验：不限制层级、不需要逐段白名单。
+
+    replace 不新建也不移动文件，只编辑已存在的文件内容——文件是人工建好的，
+    多层、隐藏目录、目录里的特殊字符都照人工的组织原样放行。路径写错的结局
+    是"文件不存在"的报错，不会越界写入。其余工具（save/rename/merge/delete）
+    仍走 _validate_category 的一级约定。
+    这里只拒绝路径语义上会造成逃逸或歧义的东西：
+      - ".." 与 "."：目录穿越/自指，任何段上出现都拒绝；
+      - 空段（连续 / 或首尾 /）：让"实际在编辑哪个文件"变得含糊——
+        "a//b.md" 与 "a/b.md" 是同一个文件，错误却像两个名字。
+    """
+    segments = category.split("/")
+    for segment in segments:
+        if not segment:
+            raise WriteError(
+                f"{which} 里的分类部分非法：{category!r} 中含有空段（连续 / 或首尾 /）。"
+            )
+        if segment in ("..", "."):
+            raise WriteError(
+                f"{which} 里的分类部分非法：{category!r} 中含有 {segment!r}（路径穿越）。"
+            )
+    return category
+
+
+def run_replace_location(config: Config, path: str) -> str:
+    """把 replace 的 path 对齐成内部形态，校验多层分类。仅供 replace_memory 使用。"""
+    relative = _normalize_path(path or "")
+    if not relative:
+        raise WriteError("path 不能为空。传 search/recent 返回的 path 即可，.md 可带可不带。")
+    if "/" in relative:
+        category, stem = _split(relative)
+        _validate_nested_category(config, category, which="path")
+        _validate_filename(config, stem, which="path")
+    else:
+        _validate_location(config, "", relative, which="path")
+    return relative
+
+
 def rename_memory(config: Config, source: str, path: str, new_path: str) -> Written:
     """把 <source>/<path>.md 改名（或移动到另一个一级分类），目标已存在即拒绝。
 
@@ -299,17 +341,16 @@ def replace_memory(config: Config, source: str, path: str,
     一两处时，调用方不必为了局部修改重发整篇内容。匹配是完全字面的：不做
     换行归一化、不做正则、不做大小写折叠。old_string 命中 0 处（内容没变）
     或 new_string 为空都直接拒绝；new_string 为空等于删除片段，同样拒绝。
+    path 里的分类路径允许多层目录（不限制层数，含隐藏目录）：replace 不新建
+    也不移动文件，深目录文件须人工先建好；save 仍只写一级分类的约定不变。
     """
     name = (source or "").strip()
     if not name:
         raise WriteError("source 不能为空。可写的 source 见 list-sources。")
     target = _writable_target(config, name)
 
-    relative = _normalize_path(path or "")
-    if not relative:
-        raise WriteError("path 不能为空。传 search/recent 返回的 path 即可，.md 可带可不带。")
-    category, stem = _validate_location(config, *_split(relative), which="path")
-    relative = f"{category}/{stem}{EXTENSION}" if category else f"{stem}{EXTENSION}"
+    relative = run_replace_location(config, path)
+    relative = f"{relative}{EXTENSION}"
 
     if not (old_string or "").strip():
         raise WriteError(
