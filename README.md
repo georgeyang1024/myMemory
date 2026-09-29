@@ -32,6 +32,7 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 - **多 source**：个人、团队、组织……每个 source 对应一个目录，可放本地盘或挂载盘
 - **NAS、webDev跨设备**：记忆目录放 NAS\webDev，多台设备挂载远端文档共用同一份记忆
 - **全文检索**：BM25 关键词匹配 + jieba 分词，无向量、无外部服务
+- **打分可调**：近期修改、路径命中的文档加分，类似的文档旧文档降级（`scoring`）
 - **证据而非答案**：检索返回带来源（source + path）的原文片段，结论由 AI 自己写
 - **启动快**：索引持久化缓存，启动先用缓存应答、后台增量校验
 - **掉盘可用**：挂载盘临时掉线时，索引与缓存原样保留，照常检索与读取
@@ -115,7 +116,7 @@ python3 run.py --logs         # 跟踪日志（Ctrl-C 只退出跟踪，不影�
 
 | 工具 | 一句话说明 |
 |---|---|
-| `search(query, limit=5, source="")` | BM25 全文检索，默认跨全部 source；返回带 `source`/`path`/`writable` 的原文片段，source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词 |
+| `search(query, limit=10, source="")` | BM25 全文检索，默认跨全部 source；返回带 `source`/`path`/`writable` 的原文片段，source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词 |
 | `get-document(source, path, offset=0, limit=40000)` | 读取原文，字符级分页；响应带 `writable` 与 `stale`（掉盘时内容来自缓存） |
 | `save(source, filename, content, category="")` | 写一篇记忆到 `<source>/<category>/<filename>.md`；**已存在即整篇覆盖**（不可撤销、无备份），空正文拒绝 |
 | `rename(source, old_path, new_path)` | 同 source 内改名/移动一级分类；旧文件必须存在，**目标存在即拒绝**，不覆盖 |
@@ -174,10 +175,34 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
   "host": "127.0.0.1",
   "port": 7083,
   "poll_interval": 600,
+  "scoring": {
+    "recency_window_days": 30,
+    "recency_bonus": 10,
+    "path_match_bonus": 5,
+    "strip_wikilinks": true
+  },
   "sources": [
-    {"name": "memory",  "dir": "D:\\memories",              "writable": true,  "description": "个人记忆"},
-    {"name": "team",    "dir": "\\\\server\\share\\team",    "writable": true,  "description": "团队共享记忆"},
-    {"name": "org",     "dir": "Z:\\org\\docs",             "writable": false, "description": "制度文档"}
+    {
+      "name": "memory",
+      "dir": "D:\\memories",
+      "writable": true,
+      "description": "个人记忆"
+    },
+    {
+      "name": "team",
+      "dir": "\\\\server\\share\\team",
+      "writable": true,
+      "description": "团队共享记忆",
+      "scoring": {
+        "recency_bonus": 0
+      }
+    },
+    {
+      "name": "org",
+      "dir": "Z:\\org\\docs",
+      "writable": false,
+      "description": "制度文档"
+    }
   ],
   "domain_terms": ["RFC9424", "AES-GCM"],
   "allow_mcp_delete": false
@@ -199,18 +224,40 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 | `max_cached_docs` | `1000` | 常驻内存的全文篇数上限（LRU）；`0` 不限 |
 | `domain_terms` | `[]` | 领域术语词表，见下 |
 | `allow_mcp_delete` | `false` | **AI 删除断路器**：`true` 时 `delete` 与 `merge`（删源）才对 AI 开放，关闭时两个工具不出现在工具列表 |
+| `scoring` | 见下 | BM25 之外的打分调整，source 可按字段覆盖 |
 
-**source**：`name` + `dir`（+ 可选 `writable`、`description`、`type`）。
+**source**：`name` + `dir`（+ 可选 `writable`、`description`、`type`、`scoring`）。
 
 - `name`：中英文、数字、下划线、连字符，1–64 字符，不含 `/`
 - `dir`：写什么就用什么（盘符或 UNC 均可），不映射不转换
 - `writable`：`false` 即只读；**省略即 `true`**。只读与名称无关
+- `scoring`：可选，只对这个 source 生效的打分覆盖，见下方 `scoring` 说明
 - 目录之间互不重叠、不嵌套（按真实路径比较，不区分大小写）
 - 名称非法、重名、重叠、字段拼错或越界时**启动即失败**；目录访问不到只警告、不失败
 
 **`domain_terms`（可选）**：型号、协议名这类 jieba 切不开的标识符。
 分词时保持为一个词，且长字母数字串会额外发出它包含的术语，
 让"用系列名检索完整型号"命中。改动会作废索引缓存（下次启动全量重建一次）。
+
+**`scoring`（打分调整）**：`score` = BM25 分 + 路径命中加分 + 时间加分，
+近期修改、路径命中的文档排到前面。写法见上方 config.json：全局一份，
+source 里的 `scoring` 只写要改的字段（上例 `team` 关掉时间加分），其余继承全局。
+决策与实测见 [ADR-0027](docs/adr/0027-search-scoring-adjustments.md)。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `recency_window_days` / `recency_bonus` | `30` / `10` | 按时间加分：30天内，按最近更新日期衰减加分，最大10分, `0` 即关闭 |
+| `path_match_bonus` | `5` | 路径命中加分：查询的每个词都出现在文档路径（含文件名）时，整篇加一次 |
+| `strip_wikilinks` | `true` | 分词前去掉 `[[...]]`，原文与偏移不变；改动会全量重建一次索引 |
+
+- 加分只改排序，不改命中集合；不宜过大（BM25 分通常几到二十几，建议加分 ≤ 10）
+- 批量改动、同步会刷新旧文档的修改时间——这类 source（如外部同步库）设 `"recency_bonus": 0`
+- 想保持旧排序：`"scoring": {"recency_bonus": 0, "path_match_bonus": 0, "strip_wikilinks": false}`
+
+CLI 等价写法：`python3 config.py config edit --scoring recency_bonus=8`（全局）、
+`python3 config.py source edit team --scoring recency_bonus=0`（单个 source）、
+`--reset-scoring 字段|all` 删除覆盖。改完重启生效；`source list` 显示覆盖，
+`/health` 的 `scoring` 显示全局有效值与各 source 的合并结果。
 
 **刷新与索引缓存**：
 
@@ -222,7 +269,7 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 - `max_cached_docs` 只限制常驻内存的**全文**篇数；所有文档照常进索引、照常可检索，
   不在缓存里的全文按需读盘。`/health` 的 `cached_docs` 是当前缓存篇数
 
-### config.py CLI：管理 source 与刷新周期
+### config.py CLI：管理配置
 
 只依赖标准库，与服务共用同一套校验——**CLI 放行的配置，服务一定能启动**；
 校验不通过时不改文件。
@@ -235,6 +282,8 @@ python3 config.py source remove <名称> [--yes] [--restart]
 python3 config.py config set poll_interval <秒> [--restart]
 python3 config.py config set max_cached_docs <篇> [--restart]
 python3 config.py config set allow_mcp_delete <true|false> [--restart]   # AI 删除开关，默认 false
+python3 config.py config edit   --scoring <字段>=<值> [--scoring …] [--reset-scoring <字段>|all] [--restart]   # 全局打分调整
+python3 config.py source edit   <名称> --scoring <字段>=<值> [--scoring …] [--reset-scoring <字段>|all] [--restart]
 python3 config.py reindex [--full]        # 立即增量刷新（--full 全量），不用重启
 python3 config.py restart                 # 调用 run.py --restart
 ```
@@ -307,10 +356,7 @@ claude mcp add myMemory --scope user `
 
 ## 更新记录
 
-各版本变化见 [CHANGELOG.md](CHANGELOG.md)：0.1.0（首个正式版本：多 source、
-可写面收敛、config.json + CLI、索引缓存与增量更新）、0.2.0（写入面扩展
-rename / replace / merge / delete 与删除断路器 `allow_mcp_delete`）与
-0.3.0（掉盘 source 数据保全：缓存只填空位、冷启动抢救旧缓存、指纹去掉版本号）。
+各版本变化见 [CHANGELOG.md](CHANGELOG.md)
 
 ---
 

@@ -515,8 +515,8 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
             "多个词以空格分隔，超过 500 字符会被截断。"
         ))],
         limit: Annotated[int, Field(description=(
-            "返回条数，1-20，默认 5。越界自动钳制，不报错。"
-        ))] = 5,
+            "返回条数，1-20，默认 10。越界自动钳制，不报错。"
+        ))] = 10,
         source: Annotated[str, Field(description=(
             "可选。只在这个 source 内检索；不传或传空字符串则跨全部 source。"
         ))] = "",

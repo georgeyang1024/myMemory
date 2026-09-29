@@ -230,3 +230,91 @@ def test_allow_mcp_delete_must_be_boolean(dirs, value):
 def test_describe_reports_allow_mcp_delete(dirs):
     config = Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")]}))
     assert config.describe()["allow_mcp_delete"] is False
+
+
+# --- scoring：打分调整（全局 + source 按字段覆盖） ---------------------------
+
+def test_scoring_defaults_when_omitted(dirs):
+    from config import Scoring
+    config = Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")]}))
+    expected = Scoring(recency_window_days=30, recency_bonus=10, path_match_bonus=5,
+                       strip_wikilinks=True)
+    assert config.scoring == expected
+    assert config.sources[0].scoring == expected
+
+
+def test_source_scoring_overrides_single_field(dirs):
+    config = Config.load(write(dirs / "config.json", {
+        "scoring": {"recency_window_days": 90, "recency_bonus": 10},
+        "sources": [ws("a", dirs / "a", scoring={"recency_window_days": 30}),
+                    ws("b", dirs / "b")],
+    }))
+    a, b = config.sources
+    assert (a.scoring.recency_window_days, a.scoring.recency_bonus) == (30, 10)
+    assert (b.scoring.recency_window_days, b.scoring.recency_bonus) == (90, 10)
+
+
+def test_source_scoring_inherits_unset_fields_from_global(dirs):
+    config = Config.load(write(dirs / "config.json", {
+        "scoring": {"path_match_bonus": 3, "strip_wikilinks": False},
+        "sources": [ws("a", dirs / "a", scoring={"recency_bonus": 0})],
+    }))
+    scoring = config.sources[0].scoring
+    assert (scoring.path_match_bonus, scoring.strip_wikilinks, scoring.recency_bonus) == (3, False, 0)
+
+
+def test_float_bonus_is_accepted(dirs):
+    config = Config.load(write(dirs / "config.json", {
+        "scoring": {"path_match_bonus": 2.5}, "sources": [ws("a", dirs / "a")]}))
+    assert config.scoring.path_match_bonus == 2.5
+
+
+@pytest.mark.parametrize("where", ["global", "source"])
+@pytest.mark.parametrize("scoring,field", [
+    ({"boost_foo": 1}, "boost_foo"),
+    ({"path_match_bonus": -1}, "path_match_bonus"),
+    ({"recency_bonus": -0.5}, "recency_bonus"),
+    ({"recency_window_days": -1}, "recency_window_days"),
+    ({"recency_window_days": 1.5}, "recency_window_days"),
+    ({"recency_window_days": True}, "recency_window_days"),
+    ({"recency_bonus": "10"}, "recency_bonus"),
+    ({"path_match_bonus": False}, "path_match_bonus"),
+    ({"strip_wikilinks": "true"}, "strip_wikilinks"),
+    ({"strip_wikilinks": 1}, "strip_wikilinks"),
+])
+def test_invalid_scoring_is_rejected_naming_the_field(dirs, where, scoring, field):
+    data = {"sources": [ws("a", dirs / "a")]}
+    if where == "global":
+        data["scoring"] = scoring
+    else:
+        data["sources"][0]["scoring"] = scoring
+    with pytest.raises(ConfigError, match=field):
+        Config.load(write(dirs / "config.json", data))
+
+
+@pytest.mark.parametrize("where", ["global", "source"])
+def test_scoring_must_be_an_object(dirs, where):
+    data = {"sources": [ws("a", dirs / "a")]}
+    if where == "global":
+        data["scoring"] = [1, 2]
+    else:
+        data["sources"][0]["scoring"] = "off"
+    with pytest.raises(ConfigError, match="scoring"):
+        Config.load(write(dirs / "config.json", data))
+
+
+def test_bootstrap_config_writes_scoring_defaults():
+    data = bootstrap_config_data()
+    assert data["scoring"] == {"recency_window_days": 30, "recency_bonus": 10,
+                               "path_match_bonus": 5, "strip_wikilinks": True}
+
+
+def test_describe_reports_effective_scoring(dirs):
+    config = Config.load(write(dirs / "config.json", {
+        "scoring": {"recency_bonus": 8},
+        "sources": [ws("a", dirs / "a"), ws("b", dirs / "b", scoring={"recency_bonus": 0})],
+    }))
+    scoring = config.describe()["scoring"]
+    assert scoring["default"]["recency_bonus"] == 8
+    assert scoring["sources"] == {"b": {"recency_window_days": 30, "recency_bonus": 0,
+                                        "path_match_bonus": 5, "strip_wikilinks": True}}

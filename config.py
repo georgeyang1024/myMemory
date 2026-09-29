@@ -16,6 +16,10 @@
     python config.py source remove <name> [--yes] [--restart]
     python config.py config set poll_interval <秒> [--restart]
     python config.py config set max_cached_docs <篇数> [--restart]
+    python config.py config edit --scoring <字段>=<值> [--scoring ...]
+                                 [--reset-scoring <字段>|all] [--restart]     # 全局打分调整
+    python config.py source edit <name> --scoring <字段>=<值> [--scoring ...]
+                                    [--reset-scoring <字段>|all] [--restart]  # 单个 source 覆盖
     python config.py reindex [--full]
     python config.py restart
 
@@ -44,6 +48,7 @@ RUN_PY = HERE / "run.py"
 
 sys.path.insert(0, str(SRC_DIR))
 from config import (  # noqa: E402
+    DEFAULTS,
     Config,
     ConfigError,
     bootstrap_config_data,
@@ -63,6 +68,9 @@ SETTABLE = {
 SETTABLE_BOOLS = {
     "allow_mcp_delete": ("AI 能否删除记忆", "delete 工具与 merge 删源对 AI 开放"),
 }
+# 打分调整（ADR-0027）：全局用 config edit --scoring，单个 source 用 source edit --scoring，写法相同。
+SCORING_FIELDS = tuple(DEFAULTS["scoring"])
+_BOOL_WORDS = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
 
 
 class CliError(Exception):
@@ -114,6 +122,35 @@ def absolute_dir(raw: str) -> str:
     return os.path.abspath(directory)
 
 
+def parse_scoring_value(field: str, raw: str) -> Any:
+    """把命令行字符串转成 scoring 字段的值。范围（非负）由保存前的完整校验把关。"""
+    text = raw.strip()
+    if field == "strip_wikilinks":
+        if text.lower() not in _BOOL_WORDS:
+            raise CliError(f"{field} 必须是 true 或 false，当前值：{raw!r}")
+        return _BOOL_WORDS[text.lower()]
+    if field == "recency_window_days":
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise CliError(f"{field} 必须是整数（天），当前值：{raw!r}") from exc
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise CliError(f"{field} 必须是数字（分），当前值：{raw!r}") from exc
+    return int(value) if value.is_integer() else value
+
+
+def format_scoring(overrides: dict[str, Any]) -> str:
+    return ", ".join(f"{k}={str(v).lower() if isinstance(v, bool) else v}"
+                     for k, v in overrides.items())
+
+
+def rebuild_note(fields) -> None:
+    if "strip_wikilinks" in fields:
+        say("注意：strip_wikilinks 改变分词结果，重启时会全量重建一次索引")
+
+
 def finish(path: Path, args: argparse.Namespace) -> int:
     say(f"已写入 {path}")
     if getattr(args, "restart", False):
@@ -141,6 +178,8 @@ def source_list(path: Path, _args: argparse.Namespace) -> int:
         line = f"  {name.ljust(width)}  {mode}  {w.get('dir', '')}"
         if w.get("description"):
             line += f"  # {w['description']}"
+        if isinstance(w.get("scoring"), dict) and w["scoring"]:
+            line += f"  [打分覆盖 {format_scoring(w['scoring'])}]"
         say(line)
     return 0
 
@@ -177,8 +216,10 @@ def source_add(path: Path, args: argparse.Namespace) -> int:
 
 
 def source_edit(path: Path, args: argparse.Namespace) -> int:
-    if args.new_name is None and args.dir is None and args.desc is None and args.writable is None:
-        raise CliError("没有要修改的内容：请指定 --name、--dir、--readonly/--writable 或 --desc 中的至少一个")
+    if (args.new_name is None and args.dir is None and args.desc is None and args.writable is None
+            and not args.scoring and not args.reset_scoring):
+        raise CliError("没有要修改的内容：请指定 --name、--dir、--readonly/--writable、--desc、"
+                       "--scoring 或 --reset-scoring 中的至少一个")
     data = copy.deepcopy(load(path))
     item = find(data, args.name)
     changes = []
@@ -199,11 +240,54 @@ def source_edit(path: Path, args: argparse.Namespace) -> int:
         else:
             item.pop("description", None)
         changes.append("描述已更新")
+    touched = edit_scoring(item, args.scoring or [], args.reset_scoring or [],
+                           f"source {args.name}")
+    if touched:
+        changes.append("打分覆盖 → " + (format_scoring(item["scoring"]) if item.get("scoring")
+                                      else "无（全部继承全局）"))
     save(path, data)
     say(f"已修改 source {args.name}：{'；'.join(changes)}")
     if args.new_name is not None and args.new_name.strip() != args.name:
         say("注意：改名会改变文档身份 (source, path)，调用方需改用新名称")
+    rebuild_note(touched)
     return finish(path, args)
+
+
+def edit_scoring(item: dict[str, Any], assignments: list[str], resets: list[str],
+                 owner: str) -> set[str]:
+    """先按 --reset-scoring 删字段，再按 --scoring 字段=值 写字段。返回动过的字段。
+
+    item 是整个配置（全局）或一个 source。只存写了的字段，没写的继承上一层；
+    清空后连 scoring 对象一起删掉。
+    """
+    raw = item.get("scoring")
+    overrides: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    touched: set[str] = set()
+    for name in resets:
+        if name == "all":
+            touched |= set(overrides)
+            overrides.clear()
+            continue
+        if name not in SCORING_FIELDS:
+            raise CliError(f"未知的打分字段：{name}；可用：{', '.join(SCORING_FIELDS)} 或 all")
+        if name not in overrides:
+            raise CliError(f"{owner} 没有设置 {name}，无需重置")
+        del overrides[name]
+        touched.add(name)
+    for assignment in assignments:
+        name, sep, value = assignment.partition("=")
+        name = name.strip()
+        if not sep:
+            raise CliError(f"--scoring 的格式是 字段=值，如 recency_bonus=0，当前：{assignment!r}")
+        if name not in SCORING_FIELDS:
+            raise CliError(f"未知的打分字段：{name}；可用：{', '.join(SCORING_FIELDS)}")
+        overrides[name] = parse_scoring_value(name, value)
+        touched.add(name)
+    if overrides:
+        item["scoring"] = overrides
+    else:
+        item.pop("scoring", None)
+    return touched
 
 
 def source_remove(path: Path, args: argparse.Namespace) -> int:
@@ -222,6 +306,19 @@ def source_remove(path: Path, args: argparse.Namespace) -> int:
 
 
 # --- config -----------------------------------------------------------------
+
+def config_edit(path: Path, args: argparse.Namespace) -> int:
+    """全局打分调整：与 source edit 的 --scoring / --reset-scoring 写法相同。"""
+    if not args.scoring and not args.reset_scoring:
+        raise CliError("没有要修改的内容：请指定 --scoring 或 --reset-scoring")
+    data = copy.deepcopy(load(path))
+    touched = edit_scoring(data, args.scoring or [], args.reset_scoring or [], "全局配置")
+    save(path, data)
+    current = format_scoring(data["scoring"]) if data.get("scoring") else "无（全部取默认值）"
+    say(f"已修改全局打分：{current}（未单独覆盖的 source 都按此计算）")
+    rebuild_note(touched)
+    return finish(path, args)
+
 
 def config_set(path: Path, args: argparse.Namespace) -> int:
     settable = sorted(set(SETTABLE) | set(SETTABLE_BOOLS))
@@ -324,6 +421,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--writable", dest="writable", action="store_true", default=None,
                       help="设为可写")
     p.add_argument("--desc", default=None, help="新描述（传空字符串清除）")
+    p.add_argument("--scoring", action="append", metavar="字段=值",
+                   help="该 source 单独的打分覆盖，可重复，如 --scoring recency_bonus=0；"
+                        f"字段：{', '.join(SCORING_FIELDS)}")
+    p.add_argument("--reset-scoring", action="append", metavar="字段",
+                   help="删除该 source 某个字段的覆盖、恢复继承全局，可重复；all 表示全部删除")
     p.add_argument("--restart", action="store_true", help="改完后重启服务")
     p.set_defaults(func=source_edit)
 
@@ -340,6 +442,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("value")
     p.add_argument("--restart", action="store_true", help="改完后重启服务")
     p.set_defaults(func=config_set)
+
+    p = cfg.add_parser("edit", help="修改全局打分调整（写法与 source edit 相同）")
+    p.add_argument("--scoring", action="append", metavar="字段=值",
+                   help=f"全局打分，可重复，如 --scoring recency_bonus=8；字段：{', '.join(SCORING_FIELDS)}")
+    p.add_argument("--reset-scoring", action="append", metavar="字段",
+                   help="删除全局某个字段、恢复默认值，可重复；all 表示全部删除")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=config_edit)
 
     p = sub.add_parser("reindex", help="通知运行中的服务立即重建索引（默认增量，无需重启）")
     p.add_argument("--full", action="store_true", help="全量重建：忽略缓存，所有文件重读、重分词")

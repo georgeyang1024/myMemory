@@ -35,7 +35,7 @@ from pathlib import PurePosixPath
 import jieba
 from rank_bm25 import BM25Okapi
 
-from config import Config
+from config import Config, Scoring
 from corpus import Chunk, DocKey, DocMeta, split_text
 from storage import AVAILABLE, DISK_OFFLINE, Availability, open_storage
 
@@ -208,7 +208,7 @@ class IndexSnapshot:
 
     __slots__ = (
         "entries", "availability", "bm25", "chunks", "documents", "contents", "cache",
-        "storages", "indexed_paths", "built_at", "build_seconds", "signature",
+        "storages", "indexed_paths", "built_at", "build_seconds", "signature", "scoring",
     )
 
     def __init__(
@@ -221,10 +221,13 @@ class IndexSnapshot:
         build_seconds: float = 0.0,
         bm25: BM25Okapi | None = None,
         reuse: "IndexSnapshot | None" = None,
+        scoring: Mapping[str, Scoring] | None = None,
     ) -> None:
         """reuse：内容签名相同的旧快照，直接沿用它的块列表与 BM25，只换条目与可用性。"""
         self.entries = entries
         self.availability = availability
+        # source 名 → 有效打分调整。未列出的 source 不做任何加分。
+        self.scoring: Mapping[str, Scoring] = dict(scoring or {})
         self.cache = cache
         self.storages = storages or {}
         self.signature = _content_signature(entries)
@@ -288,8 +291,8 @@ class IndexSnapshot:
     def availability_of(self, source: str) -> Availability:
         return self.availability.get(source, AVAILABLE)
 
-    def search(self, query: str, limit: int,
-               source: str | None = None) -> tuple[int, list[Hit]]:
+    def search(self, query: str, limit: int, source: str | None = None, *,
+               now: float | None = None) -> tuple[int, list[Hit]]:
         """BM25 检索。返回 (命中总数, 前 limit 条)。
 
         source 为 None 时跨全部 source（统一索引）；否则只保留该 source 的命中。
@@ -301,6 +304,9 @@ class IndexSnapshot:
         chunk 中时 idf 为负；其 epsilon 兜底取的是 average_idf 的倍数，
         在平均 idf 本身为负时依然为负。此时真实命中的分数是负的，
         按 score > 0 过滤会把它们整个丢掉——查询词越常见，丢得越彻底。
+
+        返回的 score = BM25 分 + 路径命中加分 + 时间加分（见 _document_bonus）。
+        now：计算时间加分用的当前时间（epoch 秒），缺省取 time.time()，便于测试固定时间。
         """
         if self.bm25 is None or not self.chunks:
             return 0, []
@@ -319,7 +325,10 @@ class IndexSnapshot:
         ]
         if not ranked:
             return 0, []
-        ranked.sort(key=lambda i: scores[i], reverse=True)
+        # 加分只作用于已确定的命中，命中集合与总数不受影响（ADR-0013 不变）。
+        bonus = self._bonus_function(query, time.time() if now is None else now)
+        final = {i: float(scores[i]) + bonus(self.chunks[i]) for i in ranked}
+        ranked.sort(key=final.__getitem__, reverse=True)
 
         # 多样性约束：同一文档最多先占 MAX_CHUNKS_PER_DOC 个位置。
         # 一个大文件的相邻 chunk 分数往往接近，不加约束会让 top-5 全来自
@@ -349,7 +358,7 @@ class IndexSnapshot:
                 Hit(
                     source=chunk.source,
                     path=chunk.path,
-                    score=float(scores[i]),
+                    score=final[i],
                     chunk_index=chunk.chunk_index,
                     char_start=chunk.char_start,
                     char_end=chunk.char_end,
@@ -357,6 +366,49 @@ class IndexSnapshot:
                 )
             )
         return len(ranked), hits
+
+    def _bonus_function(self, query: str, now: float):
+        """返回 chunk → 加分的函数。同一文档只算一次（同一文档的所有 chunk 加同样的分）。"""
+        terms = query.lower().split()
+        per_doc: dict[DocKey, float] = {}
+
+        def bonus(chunk: Chunk) -> float:
+            key = chunk.key
+            if key not in per_doc:
+                per_doc[key] = _document_bonus(self.scoring.get(chunk.source, NO_SCORING),
+                                               chunk.path, self.entries[key].mtime, terms, now)
+            return per_doc[key]
+
+        return bonus
+
+
+# 快照未提供某 source 的打分配置时使用：不做任何调整。
+NO_SCORING = Scoring(recency_bonus=0, path_match_bonus=0, strip_wikilinks=False)
+
+
+def _document_bonus(scoring: Scoring, path: str, mtime: float, terms: list[str],
+                    now: float) -> float:
+    """一篇文档在 BM25 分之上的加分。
+
+    - 路径命中：查询的每个词都是 source 内相对路径（小写）的子串时加固定分，至多一次。
+    - 时间：按 mtime 在窗口内线性衰减；窗口外为 0；mtime 在未来按年龄 0 计（不超过上限）。
+      mtime 不等于内容日期——批量改动或同步会刷新它，这类 source 应把 recency_bonus 设为 0。
+    """
+    bonus = 0.0
+    if scoring.path_match_bonus and terms:
+        lowered = path.lower()
+        if all(term in lowered for term in terms):
+            bonus += scoring.path_match_bonus
+    window = scoring.recency_window_days
+    if window and scoring.recency_bonus:
+        age_days = max(0.0, (now - mtime) / 86400.0)
+        if age_days < window:
+            bonus += scoring.recency_bonus * (1 - age_days / window)
+    return bonus
+
+
+def scoring_of(config: Config) -> dict[str, Scoring]:
+    return {src.name: src.scoring for src in config.sources}
 
 
 _jieba_ready = False
@@ -443,9 +495,29 @@ def tokenize_path(path: str, terms: tuple[str, ...] = ()) -> list[str]:
 
 # --- 构建与增量更新 --------------------------------------------------------------
 
+# Obsidian 式双链 [[目标|别名]]，只在一行之内。
+_WIKILINK = re.compile(r"\[\[[^\n]*?\]\]")
+
+
+def mask_wikilinks(text: str) -> str:
+    """把每个 [[...]] 整段替换为等长空格：字符偏移不变，跨切块边界的链接也能完整去掉。"""
+    return _WIKILINK.sub(lambda m: " " * len(m.group()), text)
+
+
+def _source_scoring(config: Config, name: str) -> Scoring:
+    for src in config.sources:
+        if src.name == name:
+            return src.scoring
+    return NO_SCORING
+
+
 def _make_entry(config: Config, source: str, path: str, mtime: float, size: int,
                 content: str, agent_mtime: float | None) -> FileEntry:
+    # 切块区间取自原文；检索词取自同一区间——开启 strip_wikilinks 时取自遮罩文本。
     pieces = split_text(content, size=config.chunk_size, step=config.chunk_step)
+    if _source_scoring(config, source).strip_wikilinks:
+        masked = mask_wikilinks(content)
+        pieces = [(start, end, masked[start:end]) for start, end, _ in pieces]
     intern = sys.intern  # 同一个词在十几万个块里反复出现，驻留后只占一份内存
     return FileEntry(
         source=source,
@@ -571,7 +643,7 @@ def build(config: Config, cache: ContentCache | None = None,
     entries, availability = refresh(config, previous, full=True, cache=cache)
     cache.retain(entries)
     snapshot = IndexSnapshot(entries=entries, availability=availability, cache=cache,
-                             storages=open_storages(config),
+                             storages=open_storages(config), scoring=scoring_of(config),
                              build_seconds=time.perf_counter() - started)
     if not snapshot.chunks:
         logger.warning("语料为空，索引不含任何 chunk")
@@ -637,6 +709,14 @@ def cache_fingerprint(config: Config) -> str:
         "extensions": sorted(config.extensions),
         "domain_terms": sorted(config.domain_terms),
         "jieba": getattr(jieba, "__version__", ""),
+        # strip_wikilinks 改变检索词。只列与全局不同的 source：新增一个用默认值的 source
+        # 不作废缓存。查询时的加分（recency_*、path_match_bonus）不进指纹。
+        "strip_wikilinks": {
+            "default": config.scoring.strip_wikilinks,
+            "overrides": {src.name: src.scoring.strip_wikilinks for src in sorted(
+                config.sources, key=lambda s: s.name)
+                if src.scoring.strip_wikilinks != config.scoring.strip_wikilinks},
+        },
     }
     return hashlib.sha256(json.dumps(basis, sort_keys=True).encode()).hexdigest()
 
@@ -716,6 +796,7 @@ def _snapshot_from_cache(config: Config, payload: dict, cache: ContentCache | No
     availability = {ws.name: open_storage(ws).probe() for ws in config.sources}
     snapshot = IndexSnapshot(entries=entries, availability=availability, bm25=bm25,
                              cache=cache, storages=open_storages(config),
+                             scoring=scoring_of(config),
                              build_seconds=time.perf_counter() - started)
     logger.info("已从缓存加载索引：%d 文档 / %d chunk / %.2fs",
                 snapshot.doc_count, snapshot.chunk_count, snapshot.build_seconds)
@@ -802,6 +883,7 @@ class IndexHolder:
             storages=self._storages,
             build_seconds=current.build_seconds,
             reuse=current,
+            scoring=current.scoring,
         )
         logger.warning("写入失败后探测到 source %s 的可用性变化：%s", name,
                        state.reason or "恢复可用")
@@ -894,6 +976,7 @@ class IndexHolder:
         self._cache.retain(entries)
         snapshot = IndexSnapshot(entries=entries, availability=availability,
                                  cache=self._cache, storages=self._storages,
+                                 scoring=scoring_of(self._config),
                                  build_seconds=time.perf_counter() - started,
                                  reuse=None if full else current)
         self._snapshot = snapshot

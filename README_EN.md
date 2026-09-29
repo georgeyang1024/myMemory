@@ -6,22 +6,25 @@
 [中文](README.md) | **English**
 
 **A local-first memory service for humans and AI agents.**
-A shared memory store that both humans and AI agents read from and write to, persisted long-term across sessions.
+A shared local memory store that both humans and AI agents read from and write to, persisted long-term across sessions.
 
-Memories are plain Markdown / text files stored in a directory you choose — no database,
-no cloud, no lock-in. AI agents retrieve and write through MCP tools; you can add, edit,
-or delete notes directly in any editor at any time, and your changes still enter the index.
+Memories are plain Markdown / text files in a directory you choose — no database,
+no cloud, no lock-in. AI agents retrieve and write through MCP tools; you can add,
+edit, or delete notes directly in any editor at any time, and your changes still
+enter the index.
 
 ---
 
 ## Features
 
-- **Full-text retrieval with BM25** keyword ranking + jieba tokenization — deterministic, explainable, fully offline
-- Multiple named *sources* (personal / team / company), each a directory on local disk or a mounted volume (NAS / webDev) → one shared memory across people and devices
-- Returns **evidence snippets with provenance** (source + path), not pre-baked answers
-- Fast start via persistent index cache; keeps serving when the mount is briefly offline
-
-Use cases: personal AI note-taking, team knowledge bases that agents can query, lightweight local search over your own documents.
+- **Multiple *sources***: personal, team, organization… each source is one directory, on local disk or a mounted volume
+- **NAS / webDev cross-device**: put the memory directory on a NAS or webDev mount, and multiple devices mounting the remote share share one memory
+- **Full-text search**: BM25 keyword matching + jieba tokenization — no vectors, no external services
+- **Tunable scoring** (`scoring`): recently modified and path-matching documents get a bonus, stale documents in similar topics get demoted
+- **Evidence, not answers**: retrieval returns raw snippets with provenance (source + path); conclusions are drawn by the AI itself
+- **Fast start**: the index has a persistent cache; startup serves from the cache first and verifies incrementally in the background
+- **Disk-outage resilient**: when a mounted volume temporarily goes offline, the index and cache stay intact and search/read keep working
+- **Constrained writable surface**: config distinguishes read-only / writable sources; AI can only write sources explicitly marked writable
 
 Design rationale and decision records: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/adr/`](docs/adr/).
 
@@ -106,7 +109,7 @@ look like `mcp__myMemory__save` (client concatenates server name + tool name).
 
 | Tool | One-line description |
 |---|---|
-| `search(query, limit=5, source="")` | BM25 full-text search across all sources by default; returns raw snippets with `source`/`path`/`writable`. Source names, categories, file names, dates (`26-08-04`), and model-style identifiers all work directly as query terms |
+| `search(query, limit=10, source="")` | BM25 full-text search across all sources by default; returns raw snippets with `source`/`path`/`writable`. Source names, categories, file names, dates (`26-08-04`), and model-style identifiers all work directly as query terms |
 | `get-document(source, path, offset=0, limit=40000)` | Read the raw document, character-level pagination; response includes `writable` and `stale` (content from cache while the disk is offline) |
 | `save(source, filename, content, category="")` | Write a memory to `<source>/<category>/<filename>.md`; **overwrites the whole file if it already exists** (irreversible, no backup); empty content rejected |
 | `rename(source, old_path, new_path)` | Rename/move a top-level category within the same source; the old file must exist, **rejects if the target exists**, never overwrites |
@@ -173,10 +176,34 @@ data. Config changes **always require a restart to take effect**.
   "host": "127.0.0.1",
   "port": 7083,
   "poll_interval": 600,
+  "scoring": {
+    "recency_window_days": 30,
+    "recency_bonus": 10,
+    "path_match_bonus": 5,
+    "strip_wikilinks": true
+  },
   "sources": [
-    {"name": "memory",  "dir": "D:\\memories",              "writable": true,  "description": "Personal memory"},
-    {"name": "team",    "dir": "\\\\server\\share\\team",    "writable": true,  "description": "Team shared memory"},
-    {"name": "org",     "dir": "Z:\\org\\docs",             "writable": false, "description": "Policy documents"}
+    {
+      "name": "memory",
+      "dir": "D:\\memories",
+      "writable": true,
+      "description": "Personal memory"
+    },
+    {
+      "name": "team",
+      "dir": "\\\\server\\share\\team",
+      "writable": true,
+      "description": "Team shared memory",
+      "scoring": {
+        "recency_bonus": 0
+      }
+    },
+    {
+      "name": "org",
+      "dir": "Z:\\org\\docs",
+      "writable": false,
+      "description": "Policy documents"
+    }
   ],
   "domain_terms": ["RFC9424", "AES-GCM"],
   "allow_mcp_delete": false
@@ -198,12 +225,14 @@ data. Config changes **always require a restart to take effect**.
 | `max_cached_docs` | `1000` | Max full texts kept in memory (LRU); `0` unlimited |
 | `domain_terms` | `[]` | Domain term list, see below |
 | `allow_mcp_delete` | `false` | **AI deletion circuit breaker**: only when `true` are `delete` and `merge` (source deletion) exposed to AI; when off, the two tools do not appear in the tool list |
+| `scoring` | see below | Score adjustments on top of BM25; sources can override per field |
 
-**source**: `name` + `dir` (+ optional `writable`, `description`, `type`).
+**source**: `name` + `dir` (+ optional `writable`, `description`, `type`, `scoring`).
 
 - `name`: Chinese/English letters, digits, underscores, hyphens, 1–64 chars, no `/`
 - `dir`: use whatever you would type (drive letter or UNC both fine), no mapping or conversion
 - `writable`: `false` means read-only; **omitting means `true`**. Read-only is unrelated to the name
+- `scoring`: optional per-source overrides of the score adjustments, see `scoring` below
 - Directories must not overlap or nest (compared by real paths, case-insensitive)
 - Invalid names, duplicates, overlaps, misspelled fields, or out-of-range values
   **fail at startup**; unreachable directories only warn, never fail
@@ -212,6 +241,29 @@ data. Config changes **always require a restart to take effect**.
 jieba cannot split. They stay as one token during tokenization, and long alphanumerical
 strings additionally emit any contained terms, so "search a full model number by its
 series name" hits. Changing it invalidates the index cache (one full rebuild on next start).
+
+**`scoring` (score adjustments)**: `score` = BM25 score + path match bonus + recency bonus,
+so recently edited and path-matching documents rank first. See the config.json example above:
+one global block, and a source's `scoring` lists only the fields to change
+(`team` turns off the recency bonus in the example); unset fields inherit the global values.
+Rationale and measurements: [ADR-0027](docs/adr/0027-search-scoring-adjustments.md).
+
+| Field | Default | Description |
+|---|---|---|
+| `recency_window_days` / `recency_bonus` | `30` / `10` | Recency bonus: decays based on last-updated date within the window, max 10 points; either `0` disables it |
+| `path_match_bonus` | `5` | Path match bonus: when every query term appears in the document's path (incl. file name), the document gets it once |
+| `strip_wikilinks` | `true` | Drop `[[...]]` before tokenization; content and offsets unchanged. Changing it triggers one full rebuild |
+
+- Bonuses only reorder hits, never admit documents without query terms; keep them moderate
+  (BM25 scores are typically a few to the low twenties, so aim for ≤ 10)
+- Bulk edits and syncing refresh old documents' mtime — set `"recency_bonus": 0` on such
+  sources (e.g. ones synced from an external system)
+- To keep the old ranking: `"scoring": {"recency_bonus": 0, "path_match_bonus": 0, "strip_wikilinks": false}`
+
+CLI equivalents: `python3 config.py config edit --scoring recency_bonus=8` (global),
+`python3 config.py source edit team --scoring recency_bonus=0` (one source),
+`--reset-scoring field|all` to drop overrides. Restart to apply; `source list` shows overrides,
+`scoring` in `/health` shows the effective global value and each source's merged result.
 
 **Refresh and index cache**:
 
@@ -225,7 +277,7 @@ series name" hits. Changing it invalidates the index cache (one full rebuild on 
   still enter the index and remain searchable, and uncached full texts are read from
   disk on demand. `cached_docs` in `/health` is the current cache count
 
-### config.py CLI: manage sources and refresh interval
+### config.py CLI: manage configuration
 
 Standard library only, shares the same validation as the server — **any config the CLI
 accepts, the server can start with**; the file is untouched when validation fails.
@@ -238,6 +290,8 @@ python3 config.py source remove <name> [--yes] [--restart]
 python3 config.py config set poll_interval <seconds> [--restart]
 python3 config.py config set max_cached_docs <docs> [--restart]
 python3 config.py config set allow_mcp_delete <true|false> [--restart]   # AI deletion switch, default false
+python3 config.py config edit   --scoring <field>=<value> [--scoring …] [--reset-scoring <field>|all] [--restart]   # global scoring
+python3 config.py source edit   <name> --scoring <field>=<value> [--scoring …] [--reset-scoring <field>|all] [--restart]
 python3 config.py reindex [--full]        # Immediate incremental refresh (--full for full), no restart needed
 python3 config.py restart                 # Calls run.py --restart
 ```
@@ -317,12 +371,7 @@ Three key points:
 
 ## Changelog
 
-Version history in [CHANGELOG.md](CHANGELOG.md): 0.1.0 (first stable release: multiple
-sources, writable-surface convergence, config.json + CLI, index cache and incremental
-updates), 0.2.0 (expanded write surface with rename / replace / merge / delete and
-the deletion circuit breaker `allow_mcp_delete`) and 0.3.0 (data preservation for
-offline sources: cache fills only empty slots, cold-start cache rescue, fingerprint
-drops the code version).
+Version history in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

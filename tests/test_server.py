@@ -186,7 +186,7 @@ def test_health_carries_index_config_and_sources(env):
     body = run_health(config, snapshot)
 
     assert body["status"] == "ok"
-    assert body["version"] == "0.3.0"
+    assert body["version"] == "0.4.0"
     assert body["doc_count"] == snapshot.doc_count
     assert body["config_file"] == str(config.config_file)
     assert body["sources"] == [

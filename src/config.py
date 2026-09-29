@@ -14,6 +14,7 @@ logs/）都放在配置文件所在的目录里，代码目录不落任何运行
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -71,6 +72,14 @@ DEFAULTS: dict[str, Any] = {
     # 默认 False：删除不可备份不可恢复，关闭时这两个工具对 AI 彻底隐藏，
     # 要开启需人工改配置并重启——这是心智上的断路器，不是运行时开关。
     "allow_mcp_delete": False,
+    # BM25 之外的打分调整，全局一份，source 可按字段覆盖
+    # （docs/adr/0027-search-scoring-adjustments.md）。
+    "scoring": {
+        "recency_window_days": 30,
+        "recency_bonus": 10,
+        "path_match_bonus": 5,
+        "strip_wikilinks": True,
+    },
 }
 
 # 字段 -> (最小值, 最大值)
@@ -87,7 +96,7 @@ _INT_RANGES: dict[str, tuple[int, int]] = {
 }
 
 _KNOWN_KEYS = frozenset(DEFAULTS) | {"sources"}
-_SOURCE_KEYS = frozenset({"name", "dir", "type", "writable", "description"})
+_SOURCE_KEYS = frozenset({"name", "dir", "type", "writable", "description", "scoring"})
 
 
 class ConfigError(ValueError):
@@ -149,6 +158,46 @@ def _real_dir(directory: Path) -> Path:
 
 
 @dataclass(frozen=True, slots=True)
+class Scoring:
+    """一个 source 的有效打分调整（全局值与 source 覆盖按字段合并后的结果）。
+
+    recency_*、path_match_bonus 在查询时叠加到 BM25 分上；strip_wikilinks 在建索引时生效。
+    """
+
+    recency_window_days: int = DEFAULTS["scoring"]["recency_window_days"]
+    recency_bonus: float = DEFAULTS["scoring"]["recency_bonus"]
+    path_match_bonus: float = DEFAULTS["scoring"]["path_match_bonus"]
+    strip_wikilinks: bool = DEFAULTS["scoring"]["strip_wikilinks"]
+
+
+def parse_scoring(raw: Any, base: Scoring, where: str = "scoring") -> Scoring:
+    """校验一个 scoring 对象，并在 base 之上按字段覆盖。raw 省略（None）即原样继承 base。
+
+    where 用于报错定位，如 "scoring" 或 "source a 的 scoring"。
+    """
+    if raw is None:
+        return base
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} 必须是对象")
+    unknown = set(raw) - set(DEFAULTS["scoring"])
+    if unknown:
+        raise ConfigError(f"{where} 含未知字段：{', '.join(sorted(unknown))}")
+    for key, value in raw.items():
+        if key == "strip_wikilinks":
+            ok = isinstance(value, bool)
+            expect = "true 或 false"
+        elif key == "recency_window_days":
+            ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            expect = "非负整数"
+        else:
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+            expect = "非负数"
+        if not ok:
+            raise ConfigError(f"{where}.{key} 必须是{expect}，当前值：{value!r}")
+    return dataclasses.replace(base, **raw)
+
+
+@dataclass(frozen=True, slots=True)
 class Source:
     """一个有名字的记忆来源：一个 source 恰好对应一个目录。"""
 
@@ -157,6 +206,7 @@ class Source:
     type: str = "local"
     writable: bool = True          # 配置里的可写标记（省略即 true）
     description: str = ""
+    scoring: Scoring = field(default_factory=Scoring)  # 有效值，不写回配置文件
 
     @property
     def can_write(self) -> bool:
@@ -250,6 +300,7 @@ def bootstrap_config_data() -> dict[str, Any]:
     for key in ("extensions", "chunk_size", "chunk_overlap", "max_results",
                 "snippet_chars", "max_doc_chars", "max_create_chars", "max_cached_docs"):
         data[key] = DEFAULTS[key]
+    data["scoring"] = dict(DEFAULTS["scoring"])
     return data
 
 
@@ -329,6 +380,7 @@ class Config:
     max_query_chars: int = field(default=500)
     domain_terms: tuple[str, ...] = field(default=())
     allow_mcp_delete: bool = field(default=False)
+    scoring: Scoring = field(default_factory=Scoring)
 
     @classmethod
     def load(cls, path: Path | None = None, *, create_default: bool = True) -> "Config":
@@ -381,6 +433,14 @@ class Config:
         if not isinstance(allow_mcp_delete, bool):
             raise ConfigError("allow_mcp_delete 必须是 true 或 false")
 
+        # 全局值在默认值之上覆盖，source 再在全局值之上按字段覆盖。
+        scoring = parse_scoring(data.get("scoring"), Scoring())
+        sources = tuple(
+            dataclasses.replace(src, scoring=parse_scoring(
+                item.get("scoring"), scoring, where=f"source {src.name} 的 scoring"))
+            for src, item in zip(sources, data["sources"])
+        )
+
         chunk_size = _int_field(data, "chunk_size")
         chunk_overlap = _int_field(data, "chunk_overlap")
         if chunk_overlap >= chunk_size:
@@ -398,13 +458,14 @@ class Config:
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             max_results=_int_field(data, "max_results"),
-            default_results=5,
+            default_results=10,
             snippet_chars=_int_field(data, "snippet_chars"),
             max_doc_chars=_int_field(data, "max_doc_chars"),
             max_create_chars=_int_field(data, "max_create_chars"),
             max_cached_docs=_int_field(data, "max_cached_docs"),
             domain_terms=domain_terms,
             allow_mcp_delete=allow_mcp_delete,
+            scoring=scoring,
         )
 
     @staticmethod
@@ -450,4 +511,10 @@ class Config:
             "max_cached_docs": self.max_cached_docs,
             "domain_terms": len(self.domain_terms),
             "allow_mcp_delete": self.allow_mcp_delete,
+            # 全局有效值，以及与之不同的 source 有效值
+            "scoring": {
+                "default": dataclasses.asdict(self.scoring),
+                "sources": {src.name: dataclasses.asdict(src.scoring) for src in self.sources
+                            if src.scoring != self.scoring},
+            },
         }

@@ -34,3 +34,6 @@ ADR-0007 的地基是"全量重建只要 2–3 秒"。挂载部门知识库（�
 - 掉盘时缓存成为该 workspace 唯一的数据来源，见 [ADR-0020](0020-mounted-disk-offline.md)。
 
 **后续 · 2026-09-28**：指纹去掉代码版本号；指纹不符时对掉盘 source 做抢救而非直接丢弃，见 [ADR-0026](0026-offline-content-natural-lru-and-cold-start-rescue.md)。
+
+**后续 · 2026-09-29**：指纹纳入 `scoring.strip_wikilinks`（全局值 + 与之不同的 source 覆盖），
+查询时加分不进指纹，见 [ADR-0027](0027-search-scoring-adjustments.md)。
