@@ -147,7 +147,10 @@ def main(argv: list[str] | None = None) -> int:
         "启动 HTTP 服务：MCP 端点 http://%s:%d/mcp ；健康检查 /health ；检索 /search?q=",
         config.host, config.port,
     )
-    uvicorn.run(app, host=config.host, port=config.port, log_level="info")
+    # uvicorn 默认空闲 5 秒即关连接；客户端连接池复用这条已关闭的连接时会报 ECONNRESET
+    # （经 Docker/WSL 端口转发时客户端往往收不到关闭通知）。放宽到 75 秒。
+    uvicorn.run(app, host=config.host, port=config.port, log_level="info",
+                timeout_keep_alive=75)
     return 0
 
 

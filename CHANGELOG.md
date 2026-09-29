@@ -10,6 +10,30 @@
 
 ---
 
+## [0.4.0] · 2026-09-29
+
+检索打分调整，详见 [ADR-0027](docs/adr/0027-search-scoring-adjustments.md) 与
+[检索说明第 4 轮](docs/RETRIEVAL-NOTES.md)。
+
+### 新增
+
+- **`scoring` 配置**（全局一份，source 可按字段覆盖）：`score` = BM25 分 + 路径命中加分 + 时间加分
+  - `recency_window_days` / `recency_bonus`（默认 30 / 10）：按文件修改时间在窗口内线性衰减加分
+  - `path_match_bonus`（默认 5）：查询的每个词都出现在文档路径（含文件名）里时，整篇文档加一次
+  - `strip_wikilinks`（默认开）：分词前整段去掉 `[[...]]`；原文、片段、偏移不变
+- `/health` 的配置摘要报告有效打分配置
+- **CLI**：`--scoring 字段=值` / `--reset-scoring 字段|all`，全局用 `config.py config edit`，
+  单个 source 用 `config.py source edit <名称>`，写法相同；`source list` 显示各 source 的覆盖
+
+### 变更
+
+- **`search` 默认返回条数 5 → 10**：`limit` 不传时返回前 10 条，上限仍为 `max_results`（默认 20）。
+- **默认开启，升级后排序会变化**。想保持旧排序：
+  `"scoring": {"recency_bonus": 0, "path_match_bonus": 0, "strip_wikilinks": false}`
+- **升级后首次启动全量重建一次索引**：`strip_wikilinks` 进入缓存指纹
+
+---
+
 ## [0.3.0] · 2026-09-28
 
 掉盘 source 的数据保全，详见 [ADR-0026](docs/adr/0026-offline-content-natural-lru-and-cold-start-rescue.md)。

@@ -309,3 +309,109 @@ def test_set_max_cached_docs(env, capsys):
     before = config.read_bytes()
     assert config_cli.main(["config", "set", "max_cached_docs", "-1"]) == 2
     assert config.read_bytes() == before
+
+
+# --- scoring：打分调整（ADR-0027） ------------------------------------------------
+
+def test_edit_global_scoring(env, capsys):
+    _, config = env
+    assert config_cli.main(["config", "edit", "--scoring", "recency_bonus=8"]) == 0
+    assert data(config)["scoring"] == {"recency_bonus": 8}, "只写改的字段，其余继续取默认值"
+    assert config_cli.main(["config", "edit", "--scoring", "path_match_bonus=2.5",
+                            "--scoring", "recency_window_days=45"]) == 0
+    assert data(config)["scoring"] == {"recency_bonus": 8, "path_match_bonus": 2.5,
+                                       "recency_window_days": 45}
+    assert "全局打分" in capsys.readouterr().out
+
+
+def test_reset_global_scoring(env):
+    _, config = env
+    config_cli.main(["config", "edit", "--scoring", "recency_bonus=8", "--scoring", "path_match_bonus=3"])
+    assert config_cli.main(["config", "edit", "--reset-scoring", "recency_bonus"]) == 0
+    assert data(config)["scoring"] == {"path_match_bonus": 3}
+    assert config_cli.main(["config", "edit", "--reset-scoring", "all"]) == 0
+    assert "scoring" not in data(config), "清空后不留空对象，全部取默认值"
+
+
+def test_edit_global_strip_wikilinks_warns_about_rebuild(env, capsys):
+    _, config = env
+    assert config_cli.main(["config", "edit", "--scoring", "strip_wikilinks=false"]) == 0
+    assert data(config)["scoring"] == {"strip_wikilinks": False}
+    assert "重建" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [
+    ["config", "edit"],
+    ["config", "edit", "--scoring", "recency_window_days=1.5"],
+    ["config", "edit", "--scoring", "recency_window_days=-1"],
+    ["config", "edit", "--scoring", "recency_bonus=abc"],
+    ["config", "edit", "--scoring", "path_match_bonus=-2"],
+    ["config", "edit", "--scoring", "strip_wikilinks=off"],
+    ["config", "edit", "--scoring", "boost_foo=1"],
+    ["config", "edit", "--reset-scoring", "recency_bonus"],   # 全局没有设置这一项
+])
+def test_invalid_global_scoring_leaves_config_untouched(env, argv, capsys):
+    _, config = env
+    before = config.read_bytes()
+    assert config_cli.main(argv) == 2
+    assert config.read_bytes() == before
+    assert "错误" in capsys.readouterr().err
+
+
+def test_scoring_is_not_settable_via_config_set(env):
+    with pytest.raises(SystemExit):
+        config_cli.main(["config", "set", "scoring.recency_bonus", "1"])
+
+
+def test_edit_source_scoring_override(env, capsys):
+    root, config = env
+    assert config_cli.main(["source", "edit", "memory", "--scoring", "recency_bonus=0"]) == 0
+    item = data(config)["sources"][0]
+    assert item["scoring"] == {"recency_bonus": 0}
+    assert item["dir"] and item["writable"] is True, "其他字段不动"
+    assert config_cli.main(["source", "edit", "memory", "--scoring", "path_match_bonus=8",
+                            "--scoring", "strip_wikilinks=false"]) == 0
+    assert data(config)["sources"][0]["scoring"] == {
+        "recency_bonus": 0, "path_match_bonus": 8, "strip_wikilinks": False}
+    assert "打分" in capsys.readouterr().out
+
+
+def test_reset_source_scoring_field_and_all(env):
+    _, config = env
+    config_cli.main(["source", "edit", "memory", "--scoring", "recency_bonus=0",
+                     "--scoring", "path_match_bonus=8"])
+    assert config_cli.main(["source", "edit", "memory", "--reset-scoring", "recency_bonus"]) == 0
+    assert data(config)["sources"][0]["scoring"] == {"path_match_bonus": 8}
+    assert config_cli.main(["source", "edit", "memory", "--reset-scoring", "all"]) == 0
+    assert "scoring" not in data(config)["sources"][0], "覆盖清空后不留空对象"
+
+
+def test_resetting_last_override_removes_scoring_object(env):
+    _, config = env
+    config_cli.main(["source", "edit", "memory", "--scoring", "recency_bonus=0"])
+    assert config_cli.main(["source", "edit", "memory", "--reset-scoring", "recency_bonus"]) == 0
+    assert "scoring" not in data(config)["sources"][0]
+
+
+@pytest.mark.parametrize("argv", [
+    ["source", "edit", "memory", "--scoring", "boost_foo=1"],
+    ["source", "edit", "memory", "--scoring", "recency_bonus"],
+    ["source", "edit", "memory", "--scoring", "recency_bonus=-1"],
+    ["source", "edit", "memory", "--scoring", "recency_window_days=abc"],
+    ["source", "edit", "memory", "--scoring", "strip_wikilinks=maybe"],
+    ["source", "edit", "memory", "--reset-scoring", "boost_foo"],
+    ["source", "edit", "memory", "--reset-scoring", "recency_bonus"],   # 没有这项覆盖
+])
+def test_invalid_source_scoring_leaves_config_untouched(env, argv, capsys):
+    _, config = env
+    before = config.read_bytes()
+    assert config_cli.main(argv) == 2
+    assert config.read_bytes() == before
+    assert "错误" in capsys.readouterr().err
+
+
+def test_list_shows_source_scoring_overrides(env, capsys):
+    config_cli.main(["source", "edit", "memory", "--scoring", "recency_bonus=0"])
+    capsys.readouterr()
+    assert config_cli.main(["source", "list"]) == 0
+    assert "recency_bonus=0" in capsys.readouterr().out

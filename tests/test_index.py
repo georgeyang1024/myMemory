@@ -801,3 +801,306 @@ def test_unreadable_cache_is_not_rescued(rescue_root: Path, monkeypatch, damage)
     holder = index.IndexHolder(config)
     holder.start()
     assert not any(k[0] == "team" for k in holder.snapshot.entries)
+
+
+# --- 打分调整：scoring（ADR-0027） ------------------------------------------------
+
+def scoring(**fields) -> dict:
+    """打分调整全关，再按需打开个别项——让每条用例只观察一种加分。"""
+    base = {"recency_window_days": 90, "recency_bonus": 0, "path_match_bonus": 0,
+            "strip_wikilinks": False}
+    base.update(fields)
+    return base
+
+
+@pytest.fixture
+def scoring_root(tmp_path: Path) -> Path:
+    raw = tmp_path / "memory"
+    files = {
+        "设计/设备安全方案总览.md": "设备 安全 方案 结论 会议",
+        "会议/26-07-15-跨部门同步/会议结论.md": "设备 安全 方案 会议 结论",
+        "会议/26-07-15-跨部门同步/方案.md": "设备 安全 方案 会议 结论",
+        "会议/设备安全问题分析与解决方案.md": "设备 安全 方案 会议 结论",
+    }
+    for rel, body in files.items():
+        (raw / rel).parent.mkdir(parents=True, exist_ok=True)
+        (raw / rel).write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def _scores(root: Path, query: str, **fields) -> dict[str, float]:
+    _, hits = build_index(root, scoring=scoring(**fields)).search(query, 20)
+    return {h.path: h.score for h in hits}
+
+
+def _path_bonus(root: Path, query: str) -> dict[str, float]:
+    """开 path_match_bonus=5 与全关相比，每篇命中文档多出的分数。"""
+    off = _scores(root, query)
+    on = _scores(root, query, path_match_bonus=5)
+    assert off.keys() == on.keys(), "加分不应改变命中集合"
+    return {path: round(on[path] - off[path], 6) for path in off}
+
+
+def test_path_bonus_when_filename_contains_whole_query(scoring_root: Path):
+    bonus = _path_bonus(scoring_root, "设备安全方案")
+    assert bonus["设计/设备安全方案总览.md"] == 5
+
+
+def test_path_bonus_when_every_term_is_in_path(scoring_root: Path):
+    bonus = _path_bonus(scoring_root, "26-07-15 会议结论")
+    assert bonus["会议/26-07-15-跨部门同步/会议结论.md"] == 5
+
+
+def test_no_path_bonus_when_only_some_terms_in_path(scoring_root: Path):
+    bonus = _path_bonus(scoring_root, "26-07-15 会议结论")
+    assert bonus["会议/26-07-15-跨部门同步/方案.md"] == 0
+
+
+def test_no_path_bonus_when_query_not_contiguous_in_path(scoring_root: Path):
+    bonus = _path_bonus(scoring_root, "设备安全方案")
+    assert bonus["会议/设备安全问题分析与解决方案.md"] == 0
+
+
+def test_path_bonus_lifts_matching_document_to_top(scoring_root: Path):
+    _, hits = build_index(scoring_root, scoring=scoring(path_match_bonus=5)).search("设备安全方案", 5)
+    assert hits[0].path == "设计/设备安全方案总览.md"
+    assert [h.score for h in hits] == sorted((h.score for h in hits), reverse=True)
+
+
+def test_path_bonus_is_counted_once_per_document(scoring_root: Path):
+    """重复的词不累加：每篇文档至多加一次。"""
+    bonus = _path_bonus(scoring_root, "会议结论 会议结论 26-07-15")
+    assert bonus["会议/26-07-15-跨部门同步/会议结论.md"] == 5
+
+
+def test_bonus_does_not_admit_documents_without_query_terms(tmp_path: Path):
+    """路径命中但没有任何检索词匹配的文档不进结果：加分只改变排序，不改变命中集合。"""
+    raw = tmp_path / "memory"
+    raw.mkdir(parents=True)
+    (raw / "labx笔记.md").write_text("完全无关的内容。", encoding="utf-8")  # "ab" 是路径子串，但不是检索词
+    (raw / "其它.md").write_text("ab 相关的内容。", encoding="utf-8")
+
+    for fields in ({}, {"path_match_bonus": 5}):
+        total, hits = build_index(tmp_path, scoring=scoring(**fields)).search("ab", 10)
+        assert total == 1
+        assert [h.path for h in hits] == ["其它.md"]
+
+
+def test_diversity_cap_still_holds_with_path_bonus(tmp_path: Path):
+    """路径命中加分让大文档的每个 chunk 都加分，但每篇文档最多两个结果位的规则不变。"""
+    raw = tmp_path / "memory"
+    raw.mkdir(parents=True)
+    (raw / "SecProto大文档.md").write_text("SecProto 机制 攻击 防护 措施。" * 400, encoding="utf-8")
+    (raw / "小文档.md").write_text("SecProto 机制 攻击 防护 措施。", encoding="utf-8")
+
+    _, hits = build_index(tmp_path, scoring=scoring(path_match_bonus=5)).search("SecProto", 3)
+    assert [h.path for h in hits].count("SecProto大文档.md") == index.MAX_CHUNKS_PER_DOC
+    assert "小文档.md" in {h.path for h in hits}
+
+
+DAY = 86400.0
+NOW = 1_800_000_000.0  # 固定"当前时间"，mtime 相对它设置
+
+
+@pytest.fixture
+def aged_root(tmp_path: Path) -> Path:
+    """正文完全相同、只有修改时间不同的几篇文档：BM25 分相同，差异只来自时间加分。"""
+    raw = tmp_path / "memory"
+    raw.mkdir(parents=True)
+    for name, age_days in {"新.md": 5, "中.md": 45, "旧.md": 80, "过期.md": 120, "未来.md": -2}.items():
+        path = raw / name
+        path.write_text("SecProto 机制 防护 措施", encoding="utf-8")
+        mtime = NOW - age_days * DAY
+        os.utime(path, (mtime, mtime))
+    return tmp_path
+
+
+def _recency_bonus(root: Path, **fields) -> dict[str, float]:
+    """开时间加分与全关相比，每篇命中文档多出的分数（当前时间固定为 NOW）。"""
+    def scores(**f):
+        _, hits = build_index(root, scoring=scoring(**f)).search("SecProto", 20, now=NOW)
+        return {h.path: h.score for h in hits}
+    off, on = scores(), scores(**fields)
+    assert off.keys() == on.keys(), "加分不应改变命中集合"
+    return {path: round(on[path] - off[path], 6) for path in off}
+
+
+def test_recency_bonus_decays_linearly(aged_root: Path):
+    bonus = _recency_bonus(aged_root, recency_window_days=90, recency_bonus=10)
+    assert bonus["中.md"] == 5
+    assert bonus["新.md"] == round(10 * (1 - 5 / 90), 6)
+
+
+def test_no_recency_bonus_outside_window(aged_root: Path):
+    bonus = _recency_bonus(aged_root, recency_window_days=90, recency_bonus=10)
+    assert bonus["过期.md"] == 0
+
+
+def test_future_mtime_gets_at_most_full_bonus(aged_root: Path):
+    bonus = _recency_bonus(aged_root, recency_window_days=90, recency_bonus=10)
+    assert bonus["未来.md"] == 10
+
+
+def test_recency_disabled_when_window_or_bonus_is_zero(aged_root: Path):
+    for fields in ({"recency_window_days": 0, "recency_bonus": 10},
+                   {"recency_window_days": 90, "recency_bonus": 0}):
+        assert set(_recency_bonus(aged_root, **fields).values()) == {0}
+
+
+def test_newer_document_beats_equally_relevant_older_one(aged_root: Path):
+    _, hits = build_index(aged_root, scoring=scoring(recency_bonus=10)).search("SecProto", 20, now=NOW)
+    order = [h.path for h in hits]
+    assert order.index("新.md") < order.index("旧.md")
+
+
+def test_source_can_disable_recency_bonus(tmp_path: Path):
+    """一个 source 关掉时间加分，只影响它自己的文档。"""
+    for name in ("fresh", "synced"):
+        (tmp_path / name).mkdir()
+        path = tmp_path / name / "机制.md"
+        path.write_text("SecProto 机制", encoding="utf-8")
+        os.utime(path, (NOW, NOW))
+
+    def scores(synced_scoring):
+        config = make_config(tmp_path, scoring=scoring(recency_bonus=10), sources=[
+            {"name": "fresh", "dir": str(tmp_path / "fresh")},
+            {"name": "synced", "dir": str(tmp_path / "synced"), "scoring": synced_scoring},
+        ])
+        _, hits = index.build(config).search("SecProto", 5, now=NOW)
+        return {h.source: h.score for h in hits}
+
+    inherit, disabled = scores({}), scores({"recency_bonus": 0})
+    assert round(inherit["synced"] - disabled["synced"], 6) == 10
+    assert inherit["fresh"] == disabled["fresh"]
+
+
+# --- strip_wikilinks：分词前整段去掉 [[...]]（等长遮罩，偏移不变） -------------
+
+@pytest.fixture
+def wikilink_root(tmp_path: Path) -> Path:
+    raw = tmp_path / "memory"
+    raw.mkdir(parents=True)
+    (raw / "链接.md").write_text(
+        "正文提到 SecProto 机制。见 [[raw/x/zqlinkword|zqalias]] 了解更多。", encoding="utf-8")
+    # 链接跨越首个切块的结尾（切块 800 字、步长 680）：半截链接也必须被去掉
+    head = "SecProto 机制说明。" * 60
+    head = head[:770]
+    body = head + "[[raw/zqcrossterm/" + "a" * 30 + "]]" + " 后续正文。" * 40
+    (raw / "跨界.md").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def _wikilink_search(root: Path, query: str, strip: bool):
+    return build_index(root, scoring=scoring(strip_wikilinks=strip)).search(query, 10)
+
+
+@pytest.mark.parametrize("query", ["zqlinkword", "zqalias", "zqcrossterm"])
+def test_wikilink_text_does_not_contribute_terms(wikilink_root: Path, query: str):
+    assert _wikilink_search(wikilink_root, query, strip=True) == (0, [])
+
+
+@pytest.mark.parametrize("query", ["zqlinkword", "zqalias", "zqcrossterm"])
+def test_wikilink_text_is_searchable_when_stripping_is_off(wikilink_root: Path, query: str):
+    total, _ = _wikilink_search(wikilink_root, query, strip=False)
+    assert total >= 1
+
+
+def test_stripping_keeps_chunk_spans_and_snippets(wikilink_root: Path):
+    on = build_index(wikilink_root, scoring=scoring(strip_wikilinks=True))
+    off = build_index(wikilink_root, scoring=scoring(strip_wikilinks=False))
+    assert {k: e.spans for k, e in on.entries.items()} == {k: e.spans for k, e in off.entries.items()}
+
+    _, hits = on.search("SecProto", 10)
+    assert hits
+    for hit in hits:
+        content = on.contents[(hit.source, hit.path)]
+        assert content[hit.char_start:hit.char_end] == hit.text
+    assert any("[[raw/x/zqlinkword|zqalias]]" in (h.text or "") for h in hits), "片段仍是原文"
+
+
+# --- 缓存指纹：strip_wikilinks 改变检索词，必须作废缓存；查询时加分不影响 --------
+
+def _fp(root: Path, **overrides) -> str:
+    return index.cache_fingerprint(make_config(root, **overrides))
+
+
+def test_toggling_strip_wikilinks_invalidates_cache(kb_root: Path):
+    assert _fp(kb_root, scoring={"strip_wikilinks": True}) != \
+        _fp(kb_root, scoring={"strip_wikilinks": False})
+
+
+def test_source_level_strip_override_invalidates_cache(kb_root: Path):
+    base = [{"name": "memory", "dir": str(kb_root / "memory")}]
+    overridden = [{**base[0], "scoring": {"strip_wikilinks": False}}]
+    assert _fp(kb_root, sources=base) != _fp(kb_root, sources=overridden)
+
+
+def test_query_time_bonuses_do_not_invalidate_cache(kb_root: Path):
+    assert _fp(kb_root) == _fp(kb_root, scoring={"recency_bonus": 3, "recency_window_days": 7,
+                                                 "path_match_bonus": 1})
+
+
+def test_adding_source_with_default_scoring_keeps_fingerprint(kb_root: Path):
+    (kb_root / "team").mkdir()
+    one = [{"name": "memory", "dir": str(kb_root / "memory")}]
+    two = one + [{"name": "team", "dir": str(kb_root / "team")}]
+    assert _fp(kb_root, sources=one) == _fp(kb_root, sources=two)
+
+
+def test_cache_written_with_other_strip_setting_is_not_fresh(kb_root: Path):
+    on = make_config(kb_root, scoring={"strip_wikilinks": True})
+    index.save_cache(on, index.build(on))
+    assert index.read_cache(on)[1] is True
+    off = make_config(kb_root, scoring={"strip_wikilinks": False})
+    assert index.read_cache(off)[1] is False
+
+
+# --- 排序回归：过期会议稿压过当前结论文档（ADR-0027 的原始问题） ------------------
+
+@pytest.fixture
+def stale_meeting_root(tmp_path: Path) -> Path:
+    """复刻原始问题：会议稿旧、词频高（目录名长题名 + 大量 wikilink），总览新、文件名含查询。"""
+    raw = tmp_path / "memory"
+    title = "设备安全问题分析与解决方案"
+    link = f"[[raw/会议/26-07-15-{title}-跨部门同步/{title}|{title}]]"
+    old = NOW - 80 * DAY
+    docs = {
+        f"会议/26-07-15-{title}-跨部门同步/{title}.md": (f"# {title}\n" + f"- {link}\n" * 12
+                                                     + "设备 安全 方案 评审。\n" * 6, old),
+        f"会议/26-07-15-{title}-跨部门同步/会议结论.md": ("会议结论：采用方案二。" + link * 6, old),
+        f"会议/26-07-17-{title}-调整2/{title}-第二版.md": (f"# {title}\n" + f"- {link}\n" * 10, old),
+        f"会议/26-07-23-{title}-组内评审/方案设计文档.md": ("设备 安全 方案 维度。" * 8 + link * 4, old),
+        "设计/设备安全方案总览.md": ("# 设备安全方案总览\n一句话结论：新方案已完成设计并通过 Demo 实测。"
+                              "安全模式采用新广播与按键鉴权。", NOW - 5 * DAY),
+    }
+    # 与查询无关的文档：让查询词只出现在少数 chunk 里，IDF 为正——与真实语料一致，
+    # 否则分数全挤在 0 附近，排序只剩并列次序。
+    for i in range(20):
+        docs[f"其它/无关{i}.md"] = (f"包装设计与物流流程说明第{i}篇。", old)
+    for rel, (body, mtime) in docs.items():
+        path = raw / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+    return tmp_path
+
+
+def test_regression_fixture_reproduces_stale_ranking_without_adjustments(stale_meeting_root: Path):
+    """前提成立：关掉全部调整时，总览确实被会议稿压在下面。"""
+    _, hits = build_index(stale_meeting_root, scoring=scoring()).search("设备安全方案", 10, now=NOW)
+    assert hits[0].score > 0, "IDF 为正，排序由词频决定而非并列次序"
+    assert hits[0].path.startswith("会议/")
+    order = [h.path for h in hits]
+    assert "设计/设备安全方案总览.md" not in order[:3]
+
+
+def test_default_scoring_puts_current_summary_first(stale_meeting_root: Path):
+    _, hits = build_index(stale_meeting_root).search("设备安全方案", 10, now=NOW)
+    assert hits[0].path == "设计/设备安全方案总览.md"
+
+
+def test_default_scoring_keeps_explicit_history_query_on_target(stale_meeting_root: Path):
+    """已接受的取舍：近期改过、含查询词的文档可能压过路径完整命中的旧文档，历史目标仍在前 2。"""
+    _, hits = build_index(stale_meeting_root).search("26-07-15 会议结论", 10, now=NOW)
+    target = "会议/26-07-15-设备安全问题分析与解决方案-跨部门同步/会议结论.md"
+    assert target in [h.path for h in hits[:2]]

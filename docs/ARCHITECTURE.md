@@ -215,7 +215,7 @@ POST /reindex[?full=1]（config.py reindex [--full]）
 **有效可写 `writable`** = 配置 `writable` 为 true **且** 存储为 local **且** source 当前可用。
 它出现在 search、recent、get-document、list-sources 与 `/health` 的每条输出里。
 
-### 6.1 `search(query, limit=5, source="")`
+### 6.1 `search(query, limit=10, source="")`
 
 BM25 全文检索，默认跨全部 source；`source` 可选。
 
@@ -234,6 +234,8 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 实现要点（沿用）：路径与 source 名参与检索但不进片段正文（[ADR-0012](adr/0012-path-and-term-tokenization.md)）；
 命中按查询词实际出现判定（[ADR-0013](adr/0013-term-presence-over-positive-score.md)）；
 同一文档最多先占 2 个结果位；入参越界钳制而非报错。
+`score` = BM25 分 + 路径命中加分 + 时间加分，加分只改变命中之间的排序，不改变命中集合；
+`scoring.strip_wikilinks` 在分词前去掉 `[[...]]`（[ADR-0027](adr/0027-search-scoring-adjustments.md)）。
 
 ### 6.2 `get-document(source, path, offset=0, limit=40000)`
 
@@ -345,7 +347,7 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 
 | 限制 | 值 |
 |---|---|
-| search 返回条数 | ≤ 20（默认 5） |
+| search 返回条数 | ≤ 20（默认 10） |
 | recent 返回条数 | ≤ 20（默认 10） |
 | 片段长度 | ≤ 1200 字符 |
 | get_document 单次返回 | ≤ 40,000 字符 |
@@ -386,6 +388,7 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | 13 | 记忆文件写入非原子（直接 `write_text`） | 落盘途中崩溃/断电会留下半截文件并被下一轮索引进去；config.json 与 index.cache 均为原子写，唯独正文没有 | 写入窗口极短；真在意的内容进版本库 | 暂不处理（2026-09-26 审查标记为已知） |
 | 14 | 首轮构建时扫描失败但盘根可访问 | 该 source 被标为"可用"却没有任何条目，直到下一轮刷新 | 首次启动的短暂窗口，能自愈 | 暂不处理（2026-09-26 审查标记为已知） |
 | 15 | `allow_mcp_delete` 开启后：真删、无备份 | 免鉴权下任意局域网调用方可删可并（删源）；融合成一堆错误记忆只在 merge 时发生 | 开关默认关、人工控制、重启生效；真在意的内容进版本库 | [ADR-0014](adr/0014-write-tool-boundary.md)（2026-09-27 修订） |
+| 16 | 时间加分按文件 mtime 计 | 批量改动、同步会刷新旧文档的 mtime；近期改过、含查询词的文档可能压过路径完整命中的旧文档 | source 级 `scoring` 覆盖（如 `recency_bonus: 0`）；历史目标仍在前 2 | [ADR-0027](adr/0027-search-scoring-adjustments.md) |
 
 ---
 
@@ -419,5 +422,6 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | [0023](adr/0023-rename-workspace-to-source.md) | 术语 | workspace 更名为 source |
 | [0024](adr/0024-max-cached-docs.md) | 内存上限 | 常驻内存的全文最多 max_cached_docs 篇（LRU） |
 | [0026](adr/0026-offline-content-natural-lru-and-cold-start-rescue.md) | 掉盘与缓存 | 刷新只填 LRU 空位；冷启动指纹不符时抢救掉盘 source；指纹去掉版本号 |
+| [0027](adr/0027-search-scoring-adjustments.md) | 检索打分 | `scoring`：时间加分、路径命中加分、分词前去除 wikilink；source 按字段覆盖 |
 
 术语定义见 [GLOSSARY.md](GLOSSARY.md)。
