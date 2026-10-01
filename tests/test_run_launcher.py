@@ -450,6 +450,60 @@ def test_ensure_config_stdio_fails_without_memory_dir(tmp_path, monkeypatch):
     assert not config.exists(), "非交互下不得用猜测的路径建档"
 
 
+def test_ensure_config_team_bootstrap(tmp_path, monkeypatch, capsys):
+    """首次建档选团队使用：写 multi_user（enabled=true、admins 默认 admin），不建公共 source。"""
+    import config as cm
+
+    store = tmp_path / "团队成员"
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("MEMORY_CONFIG", str(config))
+    monkeypatch.setattr("sys.stdin", _FakeStd(tty=True))
+    monkeypatch.setattr("sys.stdout", _FakeStd(tty=True))
+    answers = iter(["2", str(store), ""])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+
+    run.ensure_config([])
+
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert "sources" not in saved, "团队形态不建公共 source"
+    assert saved["multi_user"] == {"enabled": True, "store_dir": os.path.abspath(store),
+                                   "admins": ["admin"]}
+    assert store.is_dir(), "存储目录不存在时应自动创建"
+    # 写出的配置必须能被服务原样加载
+    loaded = cm.Config.load(config, create_default=False)
+    assert loaded.multi_user.store_dir == store
+    assert loaded.multi_user.admins == ("admin",)
+
+
+def test_write_team_config_hints(capsys):
+    """团队建档完成后的提示：子文件夹即成员、MCP 接入方式（?user=）、公共 source 补充。"""
+    run.write_team_config(Path("E:/x/config.json"), run.load_config_module(),
+                          Path("E:/x/users"), ["admin"])
+    out = capsys.readouterr().out
+    assert "团队成员" in out and "子文件夹" in out
+    assert "http://<服务器>:7083/mcp?user=<成员名>" in out
+    assert "source add" in out
+
+
+def test_ensure_config_team_bootstrap_custom_admins(tmp_path, monkeypatch):
+    """管理员账号支持逗号分隔多个；保留字（guest）重问，最终写入合法名单。"""
+    import config as cm
+
+    store = tmp_path / "users"
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("MEMORY_CONFIG", str(config))
+    monkeypatch.setattr("sys.stdin", _FakeStd(tty=True))
+    monkeypatch.setattr("sys.stdout", _FakeStd(tty=True))
+    answers = iter(["2", str(store), "guest", "李四，王五"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+
+    run.ensure_config([])
+
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["multi_user"]["admins"] == ["李四", "王五"]
+    assert cm.Config.load(config, create_default=False).multi_user.admins == ("李四", "王五")
+
+
 # --- --init：检查 / 生成 / 修复 ------------------------------------------------
 
 @pytest.fixture

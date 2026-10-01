@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import time
@@ -31,9 +32,9 @@ if sys.version_info < (3, 10):
 
 import uvicorn
 
-from config import Config, ConfigError
+from config import Config, ConfigError, effective_sources
 from index import IndexHolder, build
-from server import create_server
+from server import UserScopeMiddleware, create_server
 from storage import open_storage
 
 logger = logging.getLogger("mymemory")
@@ -44,14 +45,24 @@ def run_check(config: Config) -> int:
 
     用于部署后确认"配置正确、语料找得到、依赖装全了"，
     不必先起服务再用另一个终端 curl。
+    多人共用形态下对 effective sources（含派生个人 source）自检，
+    并报告 multi_user 状态（SPEC §4.4）。
     """
     started = time.perf_counter()
-    snapshot = build(config)
+    effective = dataclasses.replace(config, sources=effective_sources(config))
+    snapshot = build(effective)
     elapsed = time.perf_counter() - started
     print(
         f"索引自检通过：{snapshot.doc_count} 文档 / "
         f"{snapshot.chunk_count} chunk / {elapsed:.2f}s"
     )
+    if config.multi_user is not None:
+        mu = config.multi_user
+        print(
+            f"多人共用已启用：个人根目录 {mu.store_dir}；"
+            f"管理员 {', '.join(mu.admins) or '（无）'}；"
+            f"访客{'可写' if mu.guest_writable else '只读'}公共 source"
+        )
     if snapshot.doc_count == 0:
         print(
             f"警告：索引为空。若记忆库刚建好、还没写过记忆，这是正常的；"
@@ -81,6 +92,11 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         logger.error("配置错误：%s", exc)
         return 2
+
+    if use_stdio:
+        # stdio 忽略整个 multi_user 子项（SPEC §4.4）：单机语义完全不变——
+        # 公共 source 照自身 writable 可写、editor 记 agent、admins/guest_writable 无效果。
+        config = dataclasses.replace(config, multi_user=None)
 
     logger.info("配置：%s", config.describe())
     for ws in config.sources:
@@ -142,6 +158,11 @@ def main(argv: list[str] | None = None) -> int:
     logger.warning(
         "本服务无鉴权，且不校验 Host 头，请仅部署在受信任的局域网内。"
     )
+    if config.multi_user is not None:
+        logger.info(
+            "多人共用已启用：身份只来自 ?user= URL 参数（知道用户名即可冒充，"
+            "已接受的已知风险）；本服务无鉴权，请仅部署在受信任的局域网内。"
+        )
 
     logger.info(
         "启动 HTTP 服务：MCP 端点 http://%s:%d/mcp ；健康检查 /health ；检索 /search?q=",
@@ -149,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     # uvicorn 默认空闲 5 秒即关连接；客户端连接池复用这条已关闭的连接时会报 ECONNRESET
     # （经 Docker/WSL 端口转发时客户端往往收不到关闭通知）。放宽到 75 秒。
+    app = UserScopeMiddleware(app, config)
     uvicorn.run(app, host=config.host, port=config.port, log_level="info",
                 timeout_keep_alive=75)
     return 0

@@ -27,8 +27,10 @@
 
 Windows 上用 `py -3 run.py ...`，其余完全相同。
 
-配置在 ~/.myMemory/config.json；不存在时首次启动会交互询问记忆目录建档
-（stdio / 非终端环境下无法提问，启动失败并提示"未指定记忆存储"，见 docs/adr/0025）。
+配置在 ~/.myMemory/config.json；不存在时首次启动会交互建档：先问使用形态
+（个人使用 / 团队使用），个人使用指定记忆目录；团队使用指定团队存储目录
+（子文件夹 = 团队成员）与管理员账号（默认 admin）。stdio / 非终端环境下无法
+提问，启动失败并提示"未指定记忆存储"，见 docs/adr/0025。
 日志在 ~/.myMemory/logs/。
 唯一的环境变量 MEMORY_CONFIG 可以指定别的配置文件：
     MEMORY_CONFIG=/path/to/config.json python3 run.py
@@ -310,6 +312,91 @@ def write_bootstrap_config(path: Path, cm, directory: Path) -> None:
     print(f"记忆目录：{directory}。以后可用 source add 添加团队、组织等更多 source。")
 
 
+def ask_team_store_dir(cm) -> Path:
+    """团队形态的存储目录（个人根目录）：其一级子文件夹 = 团队成员。
+
+    与 ask_memory_dir 同口径：终端逐字输入、回车用默认 DATA_DIR/users、
+    不存在自动创建、非终端环境直接用默认目录并打印说明。
+    """
+    default_dir = cm.DATA_DIR / "users"
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        print("指定团队存储目录：其一级子文件夹就是团队成员（一人一个，"
+              "建目录 = 开通，目录名 = 用户名；不存在会自动创建）")
+        raw = input(f"团队存储目录 [{default_dir}]：").strip()
+        directory = Path(raw).expanduser() if raw else default_dir
+    else:
+        directory = default_dir
+        print(f"非终端环境，使用默认团队存储目录：{directory}")
+    directory = Path(os.path.abspath(directory))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def ask_admins() -> list[str]:
+    """管理员账号：逗号分隔多个；回车用默认 admin。非终端环境用默认值。"""
+    default_admins = ["admin"]
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(f"非终端环境，管理员账号用默认值：{', '.join(default_admins)}")
+        return default_admins
+    raw = input("管理员账号（多个用逗号分隔，回车默认 admin）：").strip()
+    if not raw:
+        return default_admins
+    return [item.strip() for item in raw.replace("，", ",").split(",") if item.strip()]
+
+
+def ask_team_config(cm) -> tuple[Path, list[str]]:
+    """收集团队形态配置：存储目录 + 管理员名单，现场用服务校验跑一遍，无效重问。"""
+    store = ask_team_store_dir(cm)
+    while True:
+        admins = ask_admins()
+        data = cm.bootstrap_config_data()
+        data["multi_user"] = {"enabled": True, "store_dir": str(store), "admins": admins}
+        try:
+            cm.Config.from_data(data, config_file=Path(store) / ".check.json")
+            return store, admins
+        except cm.ConfigError as exc:
+            print(f"输入无效（{exc}），请重新输入管理员账号。")
+
+
+def write_team_config(path: Path, cm, store: Path, admins: list[str]) -> None:
+    """写入团队形态首次建档配置：默认值 + multi_user（enabled=true）。
+
+    团队形态不建公共 source：语料 = 存储目录下成员子文件夹派生的个人 source。
+    """
+    data = cm.bootstrap_config_data()
+    data["multi_user"] = {"enabled": True, "store_dir": str(store), "admins": admins}
+    cm.write_json_atomic(path, data)
+    print(f"已写入 {path}")
+    print(f"团队共用已启用（multi_user）：存储目录 {store}")
+    print(f"  管理员：{', '.join(admins)}"
+          f"（更多用 config.py multi-user admin add，重启生效）")
+    print("  团队成员：在存储目录下建同名子文件夹即开通（建目录 = 开通，热生效），")
+    print("            config.py multi-user user add <名字> 是建目录的便捷封装。")
+    print("  MCP 接入：每人配同一个端点的不同 URL——")
+    print("            普通成员 http://<服务器>:7083/mcp?user=<成员名>")
+    print("            管理员   http://<服务器>:7083/mcp?user=<管理员名>（全域读写）")
+    print("            不带 ?user= 是访客：仅公共 source 且默认只读。")
+    print("  公共记忆：当前没有公共 source，需要共享记忆时用")
+    print("            config.py source add 公共 --dir <目录> 添加。")
+
+
+def bootstrap_first_config(path: Path, cm) -> None:
+    """首次建档：先问使用形态——个人使用（单个记忆目录）或团队使用（多人共用）。"""
+    print(f"首次启动：还没有配置文件（{path}）。")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("非终端环境，按个人使用建档（默认记忆目录）。"
+              "团队共用可稍后配置：python3 config.py multi-user set <存储目录>")
+        write_bootstrap_config(path, cm, ask_memory_dir(cm))
+        return
+    answer = input("选择使用形态：[1] 个人使用（默认） [2] 团队使用（多人共用）——"
+                   "输入 1 或 2，回车 = 1：").strip()
+    if answer == "2":
+        store, admins = ask_team_config(cm)
+        write_team_config(path, cm, store, admins)
+    else:
+        write_bootstrap_config(path, cm, ask_memory_dir(cm))
+
+
 def ensure_config(passthrough: list[str]) -> None:
     """首次启动（配置文件不存在）时交互式建档，否则直接返回（ADR-0025）。
 
@@ -332,8 +419,7 @@ def ensure_config(passthrough: list[str]) -> None:
         )
 
     cm = load_config_module()
-    print(f"首次启动：还没有配置文件（{path}）。")
-    write_bootstrap_config(path, cm, ask_memory_dir(cm))
+    bootstrap_first_config(path, cm)
 
 
 def setup_environment(args: argparse.Namespace) -> Path:
@@ -393,7 +479,7 @@ def do_init(args: argparse.Namespace) -> int:
 
     if not path.exists():
         print("配置文件不存在，开始建档。")
-        write_bootstrap_config(path, cm, ask_memory_dir(cm))
+        bootstrap_first_config(path, cm)
     else:
         try:
             data = cm.read_config_data(path)
@@ -403,14 +489,18 @@ def do_init(args: argparse.Namespace) -> int:
             backup.write_bytes(path.read_bytes())
             print(f"配置文件损坏（{exc}）")
             print(f"已备份原文件到 {backup}，将重新建档。")
-            write_bootstrap_config(path, cm, ask_memory_dir(cm))
+            bootstrap_first_config(path, cm)
         else:
             # 完好：只校验 + 报告。
             print("配置校验通过。")
             if not config.sources:
-                print("警告：没有任何 source，服务起不来——先补一个：")
-                print(f"  python3 config.py source add memory --dir <记忆目录> --writable")
-                code = 1
+                if config.multi_user is not None:
+                    print("团队共用形态：没有公共 source，语料来自存储目录下的成员"
+                          "子文件夹（建目录 = 开通，config.py multi-user user add <名字>）。")
+                else:
+                    print("警告：没有任何 source，服务起不来——先补一个：")
+                    print(f"  python3 config.py source add memory --dir <记忆目录> --writable")
+                    code = 1
             else:
                 for ws in config.sources:
                     state = open_storage(ws).probe()

@@ -215,3 +215,48 @@ replace 9 例、merge 9 例、delete 11 例、config/cli/contract 同步用例�
 生产部署：生产 config.json 已用 `config.py config set allow_mcp_delete true` 开启
 （用户显式选择），服务已重启（PID 33848、端口 7083、索引 415 文档 / 4094 chunk）——
 此为唯一与默认配置不同的生产项，收回删除能力只需 `"allow_mcp_delete": false` + 重启。
+
+---
+
+## 第四轮（已实施 2026-10-01）：多人共用部署
+
+决策见 [REQUIREMENTS](REQUIREMENTS.md) §16 与 [SPEC-MULTI-USER](SPEC-MULTI-USER.md)、
+[ADR-0028](adr/0028-multi-user-shared-deployment.md) ~ [ADR-0032](adr/0032-remove-merge-tool.md)。
+实施前审查补了四项关键修正（REQUIREMENTS §16 行 26~31）：**默认跨 source 路径泄漏**、
+**注入头编码与伪造**、**轮询指纹前提错误（删除指纹扩展）**、**访客默认只读（guest_writable）**。
+
+- [x] **M1 配置**：multi_user 子项（store_dir / admins / guest_writable，含
+      保留字 casefold 拒绝、嵌套禁令扩展）+ personal_sources / effective_sources /
+      ind_user / is_admin
+- [x] **M2 路由中间件**：UserScopeMiddleware（校验路径集含尾斜杠变体、URL 解码 +
+      strip 统一、percent-encode 注入 x-mymemory-user、每请求无条件删除客户端自带头、
+      未命中 400 提示联系管理员）
+- [x] **M3 会话限域**：scoped_config 三分支（访客 guest_writable / 用户 / 管理员全域）
+      + 范围名集过滤（snapshot.search 增 llowed_sources；run_search / run_recent /
+      run_get_document / _suggest 只在会话范围取材——泄漏修复）
+- [x] **M4 索引**：build / refresh / _snapshot_from_cache / _rescue_previous /
+      storages 全部改用当场枚举的 effective sources；无新指纹
+- [x] **M5 编辑者登记**：edited_by 更名 editor（recent 唯一暴露点）；写路径
+      run_save/rename/replace 增 editor 参；mark_agent 记 (mtime, editor)；
+      FileEntry.agent_editor；CACHE_FORMAT 3→4（升级首启全量重建一次，所有形态）
+- [x] **M6 merge 移除**：	ool_merge / un_merge / MERGE_DESCRIPTION /
+      writer.merge_memory / Merged 连删；llow_mcp_delete 语义收窄为只管 delete
+- [x] **M7 CLI**：multi-user set/unset/show（set 支持 --guest-writable）、
+      multi-user admin add/remove/list、multi-user user list/add
+      （多人相关子命令统一挂 multi-user 名下，2026-10-01）
+- [x] **M8 main.py**：HTTP 形态挂中间件；stdio eplace(config, multi_user=None)；
+      --check 覆盖 effective sources 并报告 multi_user 状态
+- [x] **M9 文档**：GLOSSARY（指纹条目修正、访客、multi_user）、REQUIREMENTS §16
+      （决策表 31 行）、ARCHITECTURE、README 部署章节、CHANGELOG
+- [x] **M10 首次建档选形态**（2026-10-01 追加，REQUIREMENTS §16 行 32）：
+      run.py 交互先问个人使用/团队使用；团队分支问存储目录（默认
+      ~/.myMemory/users）与 admins（默认 admin）写 multi_user（enabled: true），
+      不建公共 source；multi_user 启用时 sources 允许为空（开关关闭仍须非空）；
+      multi-user enable/disable 子命令与 enabled 开关（默认 false）、admins 默认 admin
+
+### 第四轮验收（2026-10-01）
+
+Windows .venv 全量 pytest **545 passed, 1 skipped**（新增 tests/test_multiuser.py
+54 例：配置/派生/中间件/限域与泄漏回归/REST/热发现/编辑者登记/--check）。
+CLI 冒烟：multi-user set/show、multi-user user list/add、admin add（保留字 casefold 拒绝）实测通过。
+提交前 Linux 复验全量 pytest **584 passed**（2026-10-01）。

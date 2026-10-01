@@ -35,14 +35,15 @@ from pathlib import PurePosixPath
 import jieba
 from rank_bm25 import BM25Okapi
 
-from config import Config, Scoring
+from config import Config, Scoring, effective_sources
 from corpus import Chunk, DocKey, DocMeta, split_text
 from storage import AVAILABLE, DISK_OFFLINE, Availability, open_storage
 
 logger = logging.getLogger(__name__)
 
 # 缓存格式版本。改动 FileEntry 或缓存结构时递增，旧缓存随之作废。
-CACHE_FORMAT = 3  # 2：workspace 更名为 source；3：全文移出条目，改为 LRU 全文缓存
+CACHE_FORMAT = 4  # 2：workspace 更名为 source；3：全文移出条目，改为 LRU 全文缓存；
+                  # 4：条目增 agent_editor（编辑者主体登记，ADR-0031；不兼容 3，升 0.5.0 全量重建一次）
 
 # 同一文档在单次检索结果中最多占的位置数。
 MAX_CHUNKS_PER_DOC = 2
@@ -69,9 +70,11 @@ class FileEntry:
     所有文档照常可检索，只是常驻内存的全文篇数有上限。
 
     agent_mtime：该文件经 myMemory save 写入后的落盘 mtime；与当前 mtime 相等即
-    edited_by = agent，否则为 scan（扫描发现改动；可能是人改的，也可能是别的
-    设备/程序改的，不做推断。docs/adr/0018-edited-by-via-status-file.md，
-    取代了 status.json）。
+    写后未被动过。agent_editor：那次写入的路由身份（用户名/管理员名/guest；
+    单机写入为 None）。二者决定 editor 属性（docs/adr/0018、0031）：
+    mtime 失配 → scan（扫描发现改动；可能是人改的，也可能是别的
+    设备/程序改的，不做推断）；匹配且 agent_editor 为 None → agent；
+    否则 → agent_editor。
     """
 
     source: str
@@ -83,6 +86,7 @@ class FileEntry:
     tokens: tuple[tuple[str, ...], ...]      # 每个块正文的分词结果
     path_tokens: tuple[str, ...]              # source 名 + 路径的分词结果
     agent_mtime: float | None = None
+    agent_editor: str | None = None
 
     @property
     def key(self) -> DocKey:
@@ -93,8 +97,10 @@ class FileEntry:
         return (self.mtime, self.size)
 
     @property
-    def edited_by(self) -> str:
-        return "agent" if self.agent_mtime is not None and self.agent_mtime == self.mtime else "scan"
+    def editor(self) -> str:
+        if self.agent_mtime is None or self.agent_mtime != self.mtime:
+            return "scan"
+        return self.agent_editor or "agent"
 
 
 def _content_signature(entries: dict[DocKey, FileEntry]) -> tuple:
@@ -292,10 +298,14 @@ class IndexSnapshot:
         return self.availability.get(source, AVAILABLE)
 
     def search(self, query: str, limit: int, source: str | None = None, *,
+               allowed_sources: frozenset[str] | None = None,
                now: float | None = None) -> tuple[int, list[Hit]]:
         """BM25 检索。返回 (命中总数, 前 limit 条)。
 
         source 为 None 时跨全部 source（统一索引）；否则只保留该 source 的命中。
+        allowed_sources（多人共用限域，ADR-0029 修订）：命中 chunk 所在 source
+        必须在该名集内——与 source 二选一或叠加均可；默认路径（source=None）没有
+        它就会把全局索引里所有用户的内容都返回，因此限域调用必须传。
 
         命中判定用"chunk 中确实出现了至少一个查询词"，而不是"BM25 分数 > 0"。
 
@@ -305,7 +315,7 @@ class IndexSnapshot:
         在平均 idf 本身为负时依然为负。此时真实命中的分数是负的，
         按 score > 0 过滤会把它们整个丢掉——查询词越常见，丢得越彻底。
 
-        返回的 score = BM25 分 + 路径命中加分 + 时间加分（见 _document_bonus）。
+        返回的 score = BM25 分 + 路径命中加分 + 时间加分 − 历史关键字降分（见 _document_bonus）。
         now：计算时间加分用的当前时间（epoch 秒），缺省取 time.time()，便于测试固定时间。
         """
         if self.bm25 is None or not self.chunks:
@@ -322,6 +332,7 @@ class IndexSnapshot:
             i for i in range(len(self.chunks))
             if not unique_tokens.isdisjoint(doc_freqs[i])
             and (source is None or self.chunks[i].source == source)
+            and (allowed_sources is None or self.chunks[i].source in allowed_sources)
         ]
         if not ranked:
             return 0, []
@@ -383,27 +394,33 @@ class IndexSnapshot:
 
 
 # 快照未提供某 source 的打分配置时使用：不做任何调整。
-NO_SCORING = Scoring(recency_bonus=0, path_match_bonus=0, strip_wikilinks=False)
+NO_SCORING = Scoring(recency_bonus=0, path_match_bonus=0, historical_penalty=0,
+                     strip_wikilinks=False)
 
 
 def _document_bonus(scoring: Scoring, path: str, mtime: float, terms: list[str],
                     now: float) -> float:
-    """一篇文档在 BM25 分之上的加分。
+    """一篇文档在 BM25 分之上的加分（可能为负）。
 
     - 路径命中：查询的每个词都是 source 内相对路径（小写）的子串时加固定分，至多一次。
     - 时间：按 mtime 在窗口内线性衰减；窗口外为 0；mtime 在未来按年龄 0 计（不超过上限）。
       mtime 不等于内容日期——批量改动或同步会刷新它，这类 source 应把 recency_bonus 设为 0。
+    - 历史关键字：相对路径含任一 historical_keywords（子串、不区分大小写）时扣固定分，
+      命中多个也只扣一次（docs/adr/0033）。关键字匹配在路径上，不依赖 mtime：
+      mtime 失效时由它兜底。
     """
     bonus = 0.0
-    if scoring.path_match_bonus and terms:
-        lowered = path.lower()
-        if all(term in lowered for term in terms):
-            bonus += scoring.path_match_bonus
+    lowered = path.lower()
+    if scoring.path_match_bonus and terms and all(term in lowered for term in terms):
+        bonus += scoring.path_match_bonus
     window = scoring.recency_window_days
     if window and scoring.recency_bonus:
         age_days = max(0.0, (now - mtime) / 86400.0)
         if age_days < window:
             bonus += scoring.recency_bonus * (1 - age_days / window)
+    if scoring.historical_penalty and any(
+            kw in lowered for kw in scoring.historical_keywords):
+        bonus -= scoring.historical_penalty
     return bonus
 
 
@@ -512,7 +529,8 @@ def _source_scoring(config: Config, name: str) -> Scoring:
 
 
 def _make_entry(config: Config, source: str, path: str, mtime: float, size: int,
-                content: str, agent_mtime: float | None) -> FileEntry:
+                content: str, agent_mtime: float | None,
+                agent_editor: str | None = None) -> FileEntry:
     # 切块区间取自原文；检索词取自同一区间——开启 strip_wikilinks 时取自遮罩文本。
     pieces = split_text(content, size=config.chunk_size, step=config.chunk_step)
     if _source_scoring(config, source).strip_wikilinks:
@@ -531,20 +549,25 @@ def _make_entry(config: Config, source: str, path: str, mtime: float, size: int,
         path_tokens=tuple(intern(tok) for tok in tokenize_path(f"{source}/{path}",
                                                                config.domain_terms)),
         agent_mtime=agent_mtime,
+        agent_editor=agent_editor,
     )
 
 
-def _with_agent_mark(entry: FileEntry, key: DocKey, marks: dict[DocKey, float]) -> FileEntry:
+def _with_agent_mark(entry: FileEntry, key: DocKey,
+                     marks: dict[DocKey, tuple[float, str | None]]) -> FileEntry:
     """把待并入的 agent 标记替换进沿用的旧条目。
 
     掉盘、扫描失败、单文件读取失败时，条目被原样沿用；若不在此处并入标记，
-    调用方会把标记当成已消费而清除，盘恢复后 edited_by 就会误标为 scan。
+    调用方会把标记当成已消费而清除，盘恢复后 editor 就会误标为 scan。
     版本 (mtime, size) 不变，不影响增量复用与 BM25 签名。
     """
-    agent_mtime = marks.get(key, entry.agent_mtime)
-    if agent_mtime == entry.agent_mtime:
+    mark = marks.get(key)
+    if mark is None:
         return entry
-    return dataclasses.replace(entry, agent_mtime=agent_mtime)
+    agent_mtime, agent_editor = mark
+    if (agent_mtime, agent_editor) == (entry.agent_mtime, entry.agent_editor):
+        return entry
+    return dataclasses.replace(entry, agent_mtime=agent_mtime, agent_editor=agent_editor)
 
 
 def refresh(
@@ -552,7 +575,7 @@ def refresh(
     previous: dict[DocKey, FileEntry],
     *,
     full: bool = False,
-    agent_marks: dict[DocKey, float] | None = None,
+    agent_marks: "dict[DocKey, tuple[float, str | None]] | None" = None,
     cache: ContentCache | None = None,
 ) -> tuple[dict[DocKey, FileEntry], dict[str, Availability]]:
     """按文件增量更新，返回 (新条目, 各 source 的可用性)。
@@ -605,10 +628,19 @@ def refresh(
         for stat in stats:
             key = (source.name, stat.path)
             prior = old.get(key)
-            agent_mtime = marks.get(key, prior.agent_mtime if prior else None)
+            mark = marks.get(key)
+            if mark is not None:
+                agent_mtime, agent_editor = mark
+            elif prior is not None:
+                agent_mtime, agent_editor = prior.agent_mtime, prior.agent_editor
+            else:
+                agent_mtime, agent_editor = None, None
             if not full and prior is not None and prior.version == (stat.mtime, stat.size):
-                entry = prior if prior.agent_mtime == agent_mtime else \
-                    dataclasses.replace(prior, agent_mtime=agent_mtime)
+                if (prior.agent_mtime, prior.agent_editor) == (agent_mtime, agent_editor):
+                    entry = prior
+                else:
+                    entry = dataclasses.replace(prior, agent_mtime=agent_mtime,
+                                                agent_editor=agent_editor)
             else:
                 try:
                     content = storage.read_text(stat.path)
@@ -618,7 +650,7 @@ def refresh(
                         entries[key] = _with_agent_mark(prior, key, marks)
                     continue
                 entry = _make_entry(config, source.name, stat.path, stat.mtime, stat.size,
-                                    content, agent_mtime)
+                                    content, agent_mtime, agent_editor)
                 if cache is not None:
                     cache.offer(key, entry.version, content)
             entries[key] = entry
@@ -823,10 +855,21 @@ class IndexHolder:
         self._pending_full = False
         self._verifying = False
         # save 写入后、下一轮刷新前的 agent 标记。刷新时并入条目。
-        self._agent_marks: dict[DocKey, float] = {}
+        # 值 = (落盘 mtime, 编辑者路由身份)，见 docs/adr/0031。
+        self._agent_marks: dict[DocKey, tuple[float, str | None]] = {}
         # 常驻内存的全文缓存（LRU，容量 max_cached_docs），所有快照共用这一份。
         self._cache = ContentCache(config.max_cached_docs)
-        self._storages = open_storages(config)
+        # 构建与刷新的输入是 effective sources（公共 + 当场枚举的个人 source，
+        # ADR-0029）：每次用到都重新枚举，新用户目录的出现/消失/改名即时生效。
+        self._storages = open_storages(self.effective_config())
+
+    def effective_config(self) -> Config:
+        """把基座 config 的 sources 替换为当场枚举的 effective sources。
+
+        其余字段（config_file、缓存路径、切块参数）原样——缓存身份不受
+        用户目录增删影响（cache_fingerprint 不含动态 source 名集）。
+        """
+        return dataclasses.replace(self._config, sources=effective_sources(self._config))
 
     @property
     def snapshot(self) -> IndexSnapshot:
@@ -847,8 +890,10 @@ class IndexHolder:
 
     def build_now(self, rescue: dict | None = None) -> IndexSnapshot:
         """阻塞式全量构建并写缓存。rescue：指纹不符的旧缓存载荷，见 build。"""
-        self._snapshot = build(self._config, self._cache, rescue=rescue)
-        save_cache(self._config, self._snapshot)
+        effective = self.effective_config()
+        self._snapshot = build(effective, self._cache, rescue=rescue)
+        self._storages = open_storages(effective)
+        save_cache(effective, self._snapshot)
         return self._snapshot
 
     def start(self) -> IndexSnapshot:
@@ -856,12 +901,15 @@ class IndexHolder:
 
         指纹不符时全量构建，但从旧缓存沿用 agent 标记、抢救掉盘 source（docs/adr/0026）。
         必须在开始监听端口之前调用，以避免出现"服务已启动但索引未就绪"的窗口。
+        缓存读取用 effective config：个人 source 的条目不能被基座 sources 过滤掉，
+        否则重启后、后台校验完成前个人记忆会"暂时搜不到"。
         """
         started = time.perf_counter()
-        payload, fresh = read_cache(self._config)
+        effective = self.effective_config()
+        payload, fresh = read_cache(effective)
         if not fresh:
             return self.build_now(rescue=payload)
-        cached = _snapshot_from_cache(self._config, payload, self._cache, started)
+        cached = _snapshot_from_cache(effective, payload, self._cache, started)
         self._snapshot = cached
         self._verifying = True
         self.request_rebuild("启动后台校验")
@@ -889,10 +937,11 @@ class IndexHolder:
                        state.reason or "恢复可用")
         return True
 
-    def mark_agent(self, source: str, path: str, mtime: float) -> None:
-        """save 成功后调用：记下落盘 mtime，下一轮刷新时写进该文件的条目。"""
+    def mark_agent(self, source: str, path: str, mtime: float,
+                   editor: str | None = None) -> None:
+        """save 等写入成功后调用：记下落盘 mtime 与编辑者，下一轮刷新时写进该文件的条目。"""
         with self._rebuild_lock:
-            self._agent_marks[(source, path)] = mtime
+            self._agent_marks[(source, path)] = (mtime, editor)
 
     def request_rebuild(self, reason: str, *, full: bool = False) -> bool:
         """请求一次后台刷新，**立即返回**。
@@ -952,8 +1001,9 @@ class IndexHolder:
         previous = current.entries if current is not None else {}
         logger.info("开始%s刷新索引（%s）", "全量" if full else "增量", reason)
         started = time.perf_counter()
+        effective = self.effective_config()
         try:
-            entries, availability = refresh(self._config, previous, full=full,
+            entries, availability = refresh(effective, previous, full=full,
                                             agent_marks=marks, cache=self._cache)
         except Exception:
             # 保留旧快照，服务永不因刷新失败而不可用。
@@ -963,8 +1013,8 @@ class IndexHolder:
             self._verifying = False
 
         with self._rebuild_lock:
-            for key, mtime in marks.items():
-                if self._agent_marks.get(key) == mtime:
+            for key, mark in marks.items():
+                if self._agent_marks.get(key) == mark:
                     del self._agent_marks[key]
 
         entries_changed = current is None or entries != current.entries
@@ -974,16 +1024,18 @@ class IndexHolder:
             return
         # 原子替换：单条属性赋值。在途请求继续使用旧快照。
         self._cache.retain(entries)
+        # 每轮重建 storages：动态个人 source 在上一轮可能还没有句柄。
+        self._storages = open_storages(effective)
         snapshot = IndexSnapshot(entries=entries, availability=availability,
                                  cache=self._cache, storages=self._storages,
-                                 scoring=scoring_of(self._config),
+                                 scoring=scoring_of(effective),
                                  build_seconds=time.perf_counter() - started,
                                  reuse=None if full else current)
         self._snapshot = snapshot
         logger.info("索引已刷新：%d 文档 / %d chunk / %.2fs（%s）",
                     snapshot.doc_count, snapshot.chunk_count, snapshot.build_seconds, reason)
         if full or entries_changed:
-            save_cache(self._config, snapshot)
+            save_cache(effective, snapshot)
 
     def start_polling(self) -> None:
         if self._config.poll_interval <= 0:

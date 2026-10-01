@@ -4,11 +4,13 @@
 > 0.1.0 = 第一轮改造（多 source、只读、config.json + config.py、最近编辑列表，已实施）
 > \+ 第二轮改造（工具短名、单平台运行、索引缓存与增量更新、挂载盘掉线、`/recent`）。
 > 这是第一个正式版本号，此前的 3.x / 4.0.0 版本号作废。
-> 服务当前版本 **0.3.0**（2026-09-28，掉盘 source 数据保全，见
-> [ADR-0026](adr/0026-offline-content-natural-lru-and-cold-start-rescue.md)）。
+> 服务当前版本 **0.5.0**（未发布——多人共用提案，见文末 §16 与
+> [SPEC-MULTI-USER](SPEC-MULTI-USER.md)；已发布最新版 0.4.0，2026-09-29）。
 > 第二轮追加：只读改为配置字段 `writable` 标记，不再用名称前缀（§3.2）。
 > 来源：两轮痛点评审（grilling 会话），逐条决策见文末 §14。
 > 第三轮改造（写入面扩展与删除断路器，2026-09-27 已实施）见文末 §15。
+> 第四轮改造（多人共用部署，2026-10-01 提案）见文末 §16 与
+> [SPEC-MULTI-USER](SPEC-MULTI-USER.md)。
 > 术语以 [GLOSSARY.md](GLOSSARY.md) 为准；实施后同步修订 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ---
@@ -117,8 +119,11 @@ MCP 写入形态 `<分类>/<文件名>.md` 或 `<文件名>.md`（分类为空�
   `index.cache` 与 `logs/`（日志、PID）放在配置文件所在目录——**代码目录不落任何运行数据**（第二轮追加）。
 - 字段与默认值同第一轮：`host`、`port`（7083）、`poll_interval`（600）、`sources`、`extensions`、`chunk_size`、`chunk_overlap`、`max_results`、`snippet_chars`、`max_doc_chars`、`max_create_chars`。
 - 修改一律**重启生效**；未知字段、越界、类型错误启动失败。
-- 首次启动不存在时**交互式建档**（ADR-0025）：终端逐字询问记忆目录（回车默认
-  `~/.myMemory/memory`，自动创建），生成默认值 + 一个可写 source `memory`（描述"默认记忆源"）；
+- 首次启动不存在时**交互式建档**（ADR-0025）：先问使用形态——个人使用（终端
+  逐字询问记忆目录，回车默认 `~/.myMemory/memory`，自动创建，生成默认值 +
+  一个可写 source `memory`，描述"默认记忆源"）或团队使用（询问团队存储目录，
+  子文件夹 = 团队成员，回车默认 `~/.myMemory/users`；管理员账号逗号分隔多个，
+  回车默认 admin；写 `multi_user`（`enabled: true`），不建公共 source）；
   无法交互（stdio 传输、后台子进程）时报错"未指定记忆存储"，不猜测、不静默生成。
 
 ### 4.2 运行时文件（与 config.json 同目录）
@@ -360,3 +365,56 @@ python config.py restart
 验收：全量测试 402 passed, 1 skipped；契约测试锁定"开关关闭时工具面收敛为
 BASE_TOOLS（7 个）"；真实服务经 MCP 客户端实测 9 工具在线。生产部署时用户显式
 选择开启（`allow_mcp_delete: true`）。
+
+
+---
+
+## 16. 第四轮改造：多人共用部署（2026-10-01，提案）
+
+部署到服务器供小队共用：现有 `sources` 沿用为公共 source（多人下对全部会话可见），
+新增可选大配置子项 `multi_user`（内含 `store_dir` 个人根目录与 `admins`
+管理员名单），其下一级子目录 = 一个用户 = 一个个人 source（目录名即用户名，
+恒可写）。路由走 URL 查询参数 `?user=<名字>`——每个用户在 MCP 客户端里配同一个
+端点的不同 URL。管理员全域读写（ADR-0030）；编辑者登记：recent 的
+`edited_by` 整体更名为 `editor` 并登记写入主体（ADR-0031）。开发细节见
+[SPEC-MULTI-USER](SPEC-MULTI-USER.md)，决策见
+[ADR-0028](adr/0028-multi-user-shared-deployment.md)、
+[ADR-0029](adr/0029-single-instance-scoping-and-dynamic-personal-sources.md)、
+[ADR-0030](adr/0030-multi-user-config-and-admin-full-scope.md)、
+[ADR-0031](adr/0031-editor-attribution.md)、
+[ADR-0032](adr/0032-remove-merge-tool.md)。
+
+| # | 问题 | 决策 |
+|---|---|---|
+| 1 | 路由形态 | URL 查询参数（客户端兼容性最好；SDK 工具层拿不到 query，走 ASGI 中间件注入头） |
+| 2 | 访问边界 | 路由层硬（会话只见公共+本人个人，他人 source 报"不存在"）；身份层软（知道用户名即可冒充，已接受的已知风险，后续收紧再议） |
+| 3 | 公共写权限 | 照旧由 `writable` 决定；团队约定公共配只读、管理员在服务器本地编辑 |
+| 4 | 用户开通 | 文件夹即授权：建目录=开通，不自动开通；未开通名字 HTTP 400 拒绝并提示 |
+| 5 | 规模 | ≤10 人千篇级 → 单实例全局索引 + 每请求限域，不做每用户实例 |
+| 6 | 与单机并存 | `store_dir` 未配置 = 单机形态行为不变；stdio 忽略个人根目录 |
+| 7 | source 视图 | list-sources / 默认 search / recent 均只覆盖会话范围 |
+| 8 | 嵌套 | 维持禁止：公共 source 目录与个人根目录不得互相包含（双重索引风险） |
+| 9 | 缺 user 参数 | 访客模式：仅公共 source |
+| 10 | REST | /search /recent 同规则限域；/health 按身份分层——默认仅 store_dir 与 guest_writable，`?user=<管理员名>` 另给 admins 名单与开通的用户清单；/reindex 入校验路径集、多人共用下仅管理员可触发（403），单机不限 |
+| 11 | 热生效 | 开通即刻可用（路由校验当场枚举）；索引与缓存路径全部用当场枚举的 effective sources——新目录/新文件/改名由增量刷新消化，无轮询指纹（审查修正：不存在 (文件数， max mtime) 轮询指纹，名集进 cache_fingerprint 反而作废整个缓存） |
+| 12 | 用户名匹配 | 与目录名逐字一致（大小写敏感），目录名是权威拼写 |
+| 13 | 配置重组 | `store_dir` 收进大配置子项 `multi_user`（`enabled` 开关默认 false + store_dir 必填 + admins 可选）——个人根目录与管理员同属一个开关，无悬空状态 |
+| 14 | 管理员标识 | `multi_user.admins` 配置白名单（改配置 + 重启生效），不是魔法名、不是建目录——全域权的授权动作必须重于建目录；未显式配置时默认 `["admin"]`（ADR-0030 修订二） |
+| 15 | 管理员身份 | 纯授权身份：不要求有同名个人目录（撤回初答）；名字不做命名白名单校验，唯一硬约束是不得含控制字符（防头注入） |
+| 16 | 管理员范围 | 全域单会话：公共 + 全部个人 source；list-sources 全量、search/recent 默认跨全部 |
+| 17 | 管理员边界 | 公共 source 照旧尊重 writable（不突破）；delete/merge 照旧受 allow_mcp_delete 全局断路器（不豁免）；/health 的 admins 名单与用户清单仅管理员视角可见 |
+| 18 | 路由合法集 | admins ∪ 个人目录名；管理员豁免"目录存在"要求，未知用户 400 文案不变 |
+| 19 | 编辑者字段 | recent 的 `edited_by` 整体更名 `editor`（recent 本就是唯一暴露点）；旧字段名不保留、不兼容过渡 |
+| 20 | editor 取值 | 单机形态 agent/scan 不变；多人形态 MCP 写入记路由身份（用户名/管理员名/guest，登记动作者非属主），非 MCP 改动仍 scan |
+| 21 | 保留字 | agent/scan/guest 不得用作个人目录名（派生跳过+警告）与管理员名（配置校验拒绝） |
+| 22 | 缓存升级 | 条目增 agent_editor（与 agent_mtime 并列）；CACHE_FORMAT 3→4 不兼容，升级首启全量重建一次（**所有形态含单机**；rescue 沿用 agent_mtime，editor 一次性显示为 agent） |
+| 23 | 会话与 user | user 每请求判定、不绑定 mcp 会话；客户端固定完整 URL（SSE 重连不带参数按访客放行，scope 只在 POST 工具调用上判定）；收紧候选：initialize 时绑定 user、后续不一致 403 |
+| 24 | 审计线索 | 数据层不留历史（非目标）；run_* 写入成功的 rebuild 日志理由带编辑者，轻量审计线索进日志 |
+| 25 | merge 移除 | 工具+实现连删（ADR-0032）：实践低频无用、删源不可逆风险大于便利，不做替代品；allow_mcp_delete 语义收窄为只管 delete、字段名不改；开启态契约基线 9→8 |
+| 26 | 限域两层（审查修正） | scoped config 只兜 `source=` 显式参数与写入；默认跨 source 路径（search/recent/get-document/suggest）另加会话范围名集过滤——否则从全局快照泄漏他人内容；读取类 run_* 签名演进（推翻"读取类零改动"声明） |
+| 27 | 身份来源（审查修正） | 身份只来自 `?user=`；注入的 `x-mymemory-user` 是内部通道（percent-encode 传输、读侧 decode），中间件每请求无条件删除客户端自带同名头——伪造头绕不过路由校验 |
+| 28 | 访客写公共（审查新增） | `multi_user.guest_writable`（默认 false）：访客会话对公共 source 一律只读（即使 writable: true）；匿名写团队公共记忆是多人形态新增风险面，默认关 |
+| 29 | 路径校验（审查修正） | 校验路径（/mcp、/search、/recent、/health）先去一个尾斜杠再判定，尾斜杠变体未开通同样 400——fail loud，不静默降级为访客 |
+| 30 | 匹配口径（审查统一） | user 参数解码后 strip 一次（中间件统一做），is_admin 与 find_user 都逐字比较；保留字与重名过滤 casefold（Windows 目录名不区分大小写） |
+| 31 | 自检覆盖（审查修正） | `--check` 对 effective sources（含派生个人）构建索引并报告 multi_user 状态；stdio 下 `replace(config, multi_user=None)` 忽略整个子项 |
+| 32 | 首次建档选形态（2026-10-01 追加） | `run.py` 交互建档先问个人使用/团队使用：个人同前；团队问存储目录（子文件夹 = 成员，默认 `~/.myMemory/users`）与 admins（默认 admin），写 `multi_user`（enabled: true）不建公共 source；相应放宽 `enabled: true` 时 sources 可空（开关关闭仍须至少一个），见 ADR-0025/0028 修订 |

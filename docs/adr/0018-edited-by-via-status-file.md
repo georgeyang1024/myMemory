@@ -2,6 +2,7 @@
 
 **状态**：已采纳并实施 · 2026-09-24
 **修订**：2026-09-24（二）—— status.json 删除，`agent_mtime` 并入索引缓存，见 [ADR-0019](0019-index-cache-incremental.md)。
+**修订**：2026-10-01（三）—— 对外字段 `edited_by` 整体更名为 `editor` 并登记写入主体，判定机制不变，见 [ADR-0031](0031-editor-attribution.md)。
 
 `myMemory-recent` 返回最近更新的文件（默认 10、最多 20，每文件一条，按 mtime 倒序），
 不做编辑日志、不做内容描述（服务端无 LLM，见 ADR-0003）。更改类型 `edited_by` 的判定：

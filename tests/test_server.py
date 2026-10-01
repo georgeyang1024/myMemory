@@ -1,4 +1,4 @@
-"""server 层单测：入参钳制、安全边界、分页、响应结构。"""
+﻿"""server 层单测：入参钳制、安全边界、分页、响应结构。"""
 
 from pathlib import Path
 
@@ -186,7 +186,7 @@ def test_health_carries_index_config_and_sources(env):
     body = run_health(config, snapshot)
 
     assert body["status"] == "ok"
-    assert body["version"] == "0.4.0"
+    assert body["version"] == "0.5.0"
     assert body["doc_count"] == snapshot.doc_count
     assert body["config_file"] == str(config.config_file)
     assert body["sources"] == [
@@ -304,7 +304,7 @@ def test_recent_orders_by_mtime_and_limits(multi):
     assert run_recent(multi, snapshot, -1)["returned"] == 1
 
     first = default["results"][0]
-    assert set(first) == {"source", "path", "writable", "updated_at", "size", "edited_by"}
+    assert set(first) == {"source", "path", "writable", "updated_at", "size", "editor"}
     assert first["source"] == "memory" and first["size"] == 24
     assert first["updated_at"].startswith("2023-11-")
 
@@ -317,7 +317,7 @@ def test_recent_one_entry_per_file(multi):
     assert [r["path"] for r in body["results"]] == ["同一篇.md"]
 
 
-def test_recent_edited_by_agent_then_scan(multi):
+def test_recent_editor_agent_then_scan(multi):
     holder = index.IndexHolder(multi)
     holder.build_now()
     run_save(multi, holder, "team", "技术", "规范", "agent 写的")
@@ -325,7 +325,7 @@ def test_recent_edited_by_agent_then_scan(multi):
     holder.request_rebuild("测试")
     snapshot = _settle(holder)
 
-    by_key = {(r["source"], r["path"]): r["edited_by"]
+    by_key = {(r["source"], r["path"]): r["editor"]
               for r in run_recent(multi, snapshot, 20)["results"]}
     assert by_key[("team", "技术/规范.md")] == "agent"
     assert by_key[("memory", "扫描发现的.md")] == "scan"
@@ -336,7 +336,7 @@ def test_recent_edited_by_agent_then_scan(multi):
     os.utime(agent_file, (later, later))
     holder.request_rebuild("测试")
     snapshot = _settle(holder)
-    by_key = {(r["source"], r["path"]): r["edited_by"]
+    by_key = {(r["source"], r["path"]): r["editor"]
               for r in run_recent(multi, snapshot, 20)["results"]}
     assert by_key[("team", "技术/规范.md")] == "scan"
 
@@ -352,7 +352,7 @@ def test_recent_agent_mark_survives_restart(multi):
     snapshot = _settle(restarted)
     body = run_recent(multi, snapshot, 5)
     assert body["results"][0]["path"] == "重启前.md"
-    assert body["results"][0]["edited_by"] == "agent"
+    assert body["results"][0]["editor"] == "agent"
 
 
 def test_recent_scoped_and_unknown_source(multi):

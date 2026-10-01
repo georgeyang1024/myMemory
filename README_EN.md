@@ -72,11 +72,18 @@ python3 run.py --help          # All options
 
 A few notes:
 
-- **First launch** interactively asks for the memory directory (Enter uses the default
-  `~/.myMemory/memory`, created automatically) and generates `~/.myMemory/config.json`.
+- **First launch** interactively creates the setup (generates `~/.myMemory/config.json`):
+  - **Personal use** (default): asks for the memory directory; Enter uses the default
+    `~/.myMemory/memory` (created automatically);
+  - **Team use**: asks for the team storage directory (its subfolders are the team members,
+    one per person; Enter defaults to `~/.myMemory/users`) and admin accounts (comma-separated,
+    Enter defaults to admin), writes `multi_user` (`enabled: true`); no public source is
+    created — add one later with `config.py source add` when shared memory is needed. Then
+    configure the MCP endpoint as prompted: `http://<server>:7083/mcp?user=<member name>`.
   In non-interactive environments (stdio, background subprocess), missing config reports
   "no memory storage specified" — finish the initial setup in a terminal first, or run
-  `python3 run.py --init`.
+  `python3 run.py --init` (in non-terminal mode it falls back to personal use + the
+  default directory).
 - Unrecognized arguments (e.g. `--check`, `--stdio`) are passed through to the service itself.
 - When `requirements.txt` changes, dependencies are reinstalled automatically; no manual cleanup needed.
 - The only config-related environment variable is `MEMORY_CONFIG` (points to the config
@@ -150,7 +157,7 @@ look like `mcp__myMemory__save` (client concatenates server name + tool name).
 | `GET /health` | Version, index size, build time, `rebuilding`, `verifying`, current config, source list (with directory paths and availability) |
 | `GET /search?q=…&limit=…&source=…` | Identical response structure to MCP `search` |
 | `GET /recent?limit=…&source=…` | Identical response structure to MCP `recent` |
-| `POST /reindex[?full=1]` | Refresh the index immediately; incremental by default, `full=1` for a full rebuild |
+| `POST /reindex[?full=1]` | Refresh the index immediately; incremental by default, `full=1` for a full rebuild (admin-only under multi-user shared mode, see below) |
 
 ```powershell
 curl.exe http://127.0.0.1:7083/health
@@ -180,7 +187,9 @@ data. Config changes **always require a restart to take effect**.
     "recency_window_days": 30,
     "recency_bonus": 10,
     "path_match_bonus": 5,
-    "strip_wikilinks": true
+    "strip_wikilinks": true,
+    "historical_penalty": 0,
+    "historical_keywords": []
   },
   "sources": [
     {
@@ -242,22 +251,31 @@ jieba cannot split. They stay as one token during tokenization, and long alphanu
 strings additionally emit any contained terms, so "search a full model number by its
 series name" hits. Changing it invalidates the index cache (one full rebuild on next start).
 
-**`scoring` (score adjustments)**: `score` = BM25 score + path match bonus + recency bonus,
-so recently edited and path-matching documents rank first. See the config.json example above:
-one global block, and a source's `scoring` lists only the fields to change
-(`team` turns off the recency bonus in the example); unset fields inherit the global values.
-Rationale and measurements: [ADR-0027](docs/adr/0027-search-scoring-adjustments.md).
+**`scoring` (score adjustments)**: `score` = BM25 score + path match bonus + recency bonus
+− historical penalty, so recently edited and path-matching documents rank first while
+stale documents whose paths contain a historical marker keyword are demoted. See the
+config.json example above: one global block, and a source's `scoring` lists only the
+fields to change (`team` turns off the recency bonus in the example); unset fields
+inherit the global values.
+Rationale and measurements: [ADR-0027](docs/adr/0027-search-scoring-adjustments.md) and
+[ADR-0033](docs/adr/0033-search-historical-keyword-penalty.md).
 
 | Field | Default | Description |
 |---|---|---|
 | `recency_window_days` / `recency_bonus` | `30` / `10` | Recency bonus: decays based on last-updated date within the window, max 10 points; either `0` disables it |
 | `path_match_bonus` | `5` | Path match bonus: when every query term appears in the document's path (incl. file name), the document gets it once |
 | `strip_wikilinks` | `true` | Drop `[[...]]` before tokenization; content and offsets unchanged. Changing it triggers one full rebuild |
+| `historical_penalty` | `0` | Historical penalty: documents whose relative path (dirs + file name) contains any keyword get demoted once; `0` disables |
+| `historical_keywords` | `[]` | Historical marker keyword array (≤100 entries), substring match, case-insensitive; e.g. `["meeting", "deprecated"]` |
 
-- Bonuses only reorder hits, never admit documents without query terms; keep them moderate
-  (BM25 scores are typically a few to the low twenties, so aim for ≤ 10)
+- Bonuses/penalties only reorder hits, never change the hit set; keep them moderate
+  (BM25 scores are typically a few to the low twenties, so aim for |value| ≤ 10)
 - Bulk edits and syncing refresh old documents' mtime — set `"recency_bonus": 0` on such
-  sources (e.g. ones synced from an external system)
+  sources (e.g. ones synced from an external system) and fall back on
+  `historical_penalty` + `historical_keywords` (not mtime-dependent)
+- Historical penalty is off by default: keywords are substring matches, so any path
+  containing a keyword (even unrelated notes) gets demoted — grep your corpus for
+  collateral damage before enabling
 - To keep the old ranking: `"scoring": {"recency_bonus": 0, "path_match_bonus": 0, "strip_wikilinks": false}`
 
 CLI equivalents: `python3 config.py config edit --scoring recency_bonus=8` (global),
@@ -301,6 +319,76 @@ python3 config.py restart                 # Calls run.py --restart
 > under the user who has that drive letter mapped.
 > Modifying commands require a manual `config.py restart` by default; add `--restart`
 > to restart right after the change.
+
+### Multi-user shared deployment (teams of ≤10)
+
+One instance shared by a small team: the sources in `sources` are public sources
+(visible to all sessions), and on the server each first-level subdirectory of a
+"personal root directory" = one user = one personal source. Identity comes only from
+the `?user=` parameter on the URL (anyone who knows a username can impersonate —
+an accepted known risk; tightening later is up for discussion).
+
+Configured in the `multi_user` sub-object of `config.json` (CLI-only also works,
+no hand editing needed):
+
+```json
+{
+  "multi_user": {
+    "enabled": true,
+    "store_dir": "E:\\UserDocs",
+    "admins": ["admin"],
+    "guest_writable": false
+  }
+}
+```
+
+- `enabled` (default false): the multi-user master switch. When omitted (or false),
+  even a configured `multi_user` block stays single-user mode; pre-configuring but
+  not enabling is common — flip to true explicitly when needed
+  (CLI: `multi-user enable` / `multi-user disable`).
+- `store_dir` (required): the personal root directory; its first-level subdirectories
+  = users = personal sources;
+- `admins` (optional): admin list, `?user=<admin name>` gets read/write everywhere;
+  defaults to `["admin"]` when not configured (the default admin is admin);
+- `guest_writable` (default false): whether guests (anonymous connections without
+  `?user=`) can write public sources; read-only by default, set true only if
+  anonymous writing is truly needed.
+
+```
+Server (admin's own machine, in a terminal)     Users (one per person)
+1. config.py source add shared --dir <dir> --readonly
+2. config.py multi-user set <personal root>    # writes enabled: true (restart to apply)
+3. config.py multi-user user add 张三   # or create the directory manually; directory = provisioned, hot
+4. config.py multi-user admin add admin   # optional: the default admin is already admin
+5. python run.py --background     # start/restart the service
+                                           MCP client config (regular user):
+                                           {"type": "http",
+                                            "url": "http://<server>:7083/mcp?user=张三"}
+                                           MCP client config (admin):
+                                           {"type": "http",
+                                            "url": "http://<server>:7083/mcp?user=李四"}
+```
+
+- Session scope = all public sources + the user's own personal source (admins get
+  everything); requests outside the scope are rejected as "source does not exist",
+  without revealing other users. Misspelled username → 400 with a hint.
+- `POST /reindex` is **admin-only** under multi-user (others get 403); `config.py reindex`
+  automatically carries admin identity (first entry of a non-empty `admins`, default
+  admin otherwise, or specify with `--user`). Single-user mode (switch off) is unrestricted.
+- Provision a new user: just create the directory on the server, no restart;
+  new admin: `multi-user admin add` + restart.
+- Revoke a user: delete the directory (index and cache are cleaned along with it;
+  back up the content first — no recycle bin).
+- Guests (anonymous connections without `?user=`): see public sources only,
+  **read-only** by default (set `"guest_writable": true` in `multi_user` only if
+  anonymous writing is truly needed).
+- The `multi_user` block in `/health` is layered by identity: by default it only
+  reports `store_dir` (personal root) and `guest_writable`; `/health?user=<admin name>`
+  additionally reports the `admins` list and each user's provisioning status.
+  Day-to-day provisioning stays on the server with `config.py multi-user show` and
+  `config.py multi-user user list`.
+- See [SPEC-MULTI-USER](docs/SPEC-MULTI-USER.md) and
+  [ADR-0028](docs/adr/0028-multi-user-shared-deployment.md) ~ [ADR-0032](docs/adr/0032-remove-merge-tool.md).
 
 ---
 

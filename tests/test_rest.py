@@ -1,4 +1,4 @@
-"""REST 端点：/health、/search、POST /reindex，走真实的 ASGI 应用。
+﻿"""REST 端点：/health、/search、POST /reindex，走真实的 ASGI 应用。
 
 不依赖 httpx：直接按 ASGI 协议发一个请求，拿回状态码与 JSON。
 """
@@ -134,7 +134,7 @@ def test_recent_endpoint_returns_json(setup):
     assert status == 200 and body["returned"] == 2
     assert {r["source"] for r in body["results"]} == {"memory", "org"}
     assert {r["source"]: r["writable"] for r in body["results"]} == {"memory": True, "org": False}
-    assert set(body["results"][0]) == {"source", "path", "writable", "updated_at", "size", "edited_by"}
+    assert set(body["results"][0]) == {"source", "path", "writable", "updated_at", "size", "editor"}
 
     status, body = call(app, "GET", "/recent", "limit=1&source=org")
     assert status == 200 and [r["path"] for r in body["results"]] == ["制度.md"]
