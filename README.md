@@ -69,7 +69,7 @@ python3 run.py
 启动服务，并负责后台启停。依赖装齐后重复启动秒过。
 
 ```powershell
-python3 run.py                 # 前台启动（首次会交互询问记忆目录，回车用默认）
+python3 run.py                 # 前台启动（首次会交互建档：个人使用 / 团队使用）
 python3 run.py --check         # 自检：构建一次索引并报告规模，不监听端口
 python3 run.py --init          # 建档/修复配置 + 装齐依赖；已就绪则秒过
 python3 run.py --reinstall     # 强制重装依赖
@@ -83,9 +83,14 @@ python3 run.py --help          # 全部选项
 
 几点说明：
 
-- **首次启动**交互询问记忆目录（回车默认 `~/.myMemory/memory`，自动创建），
-  生成 `~/.myMemory/config.json`。非交互环境（stdio、后台子进程）遇缺配置会报
-  "未指定记忆存储"——先在终端完成建档，或运行 `python3 run.py --init`。
+- **首次启动**交互建档（生成 `~/.myMemory/config.json`）：
+  - **个人使用**（默认）：询问记忆目录，回车默认 `~/.myMemory/memory`（自动创建）；
+  - **团队使用**：询问团队存储目录（子文件夹就是团队成员，一人一个，回车默认
+    `~/.myMemory/users`）与管理员账号（逗号分隔多个，回车默认 admin），写入
+    `multi_user`（`enabled: true`）；不建公共 source，需要共享记忆时再
+    `config.py source add`。完成后按提示配 MCP 端点：`http://<服务器>:7083/mcp?user=<成员名>`。
+  非交互环境（stdio、后台子进程）遇缺配置会报"未指定记忆存储"——先在终端完成
+  建档，或运行 `python3 run.py --init`（非终端下按个人使用 + 默认目录兜底）。
 - 未被识别的参数（如 `--check`、`--stdio`）会原样传给服务本身。
 - `requirements.txt` 变更时会自动重装依赖，不需要手工清理环境。
 - 配置里的环境变量只有 `MEMORY_CONFIG`（指定配置文件位置）；另有可选的
@@ -151,7 +156,7 @@ HTTP 模式下附带 4 个端点：
 | `GET /health` | 版本、索引规模、构建时间、`rebuilding`、`verifying`、当前配置、source 列表（含目录路径与可用性） |
 | `GET /search?q=…&limit=…&source=…` | 与 MCP `search` 返回结构完全一致 |
 | `GET /recent?limit=…&source=…` | 与 MCP `recent` 返回结构完全一致 |
-| `POST /reindex[?full=1]` | 立即刷新索引；默认增量，`full=1` 全量重建 |
+| `POST /reindex[?full=1]` | 立即刷新索引；默认增量，`full=1` 全量重建（多人共用下仅管理员，见下文） |
 
 ```powershell
 curl.exe http://127.0.0.1:7083/health
@@ -179,7 +184,9 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
     "recency_window_days": 30,
     "recency_bonus": 10,
     "path_match_bonus": 5,
-    "strip_wikilinks": true
+    "strip_wikilinks": true,
+    "historical_penalty": 0,
+    "historical_keywords": []
   },
   "sources": [
     {
@@ -211,7 +218,7 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `sources` | 首次建档生成一个 `memory` | 见下 |
+| `sources` | 首次建档生成一个 `memory`（团队形态可无） | 见下 |
 | `host` | `127.0.0.1` | 绑定地址。默认只监听本机；要局域网访问改 `0.0.0.0` |
 | `port` | `7083` | 监听端口 |
 | `poll_interval` | `600` | 轮询间隔（秒）；`0` 关闭（不影响 save 的主动刷新） |
@@ -239,19 +246,25 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 分词时保持为一个词，且长字母数字串会额外发出它包含的术语，
 让"用系列名检索完整型号"命中。改动会作废索引缓存（下次启动全量重建一次）。
 
-**`scoring`（打分调整）**：`score` = BM25 分 + 路径命中加分 + 时间加分，
-近期修改、路径命中的文档排到前面。写法见上方 config.json：全局一份，
-source 里的 `scoring` 只写要改的字段（上例 `team` 关掉时间加分），其余继承全局。
-决策与实测见 [ADR-0027](docs/adr/0027-search-scoring-adjustments.md)。
+**`scoring`（打分调整）**：`score` = BM25 分 + 路径命中加分 + 时间加分 − 历史降分，
+近期修改、路径命中的文档排到前面，路径含历史标记词的旧文档降级。写法见上方 config.json：
+全局一份，source 里的 `scoring` 只写要改的字段（上例 `team` 关掉时间加分），其余继承全局。
+决策与实测见 [ADR-0027](docs/adr/0027-search-scoring-adjustments.md)、
+[ADR-0033](docs/adr/0033-search-historical-keyword-penalty.md)。
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `recency_window_days` / `recency_bonus` | `30` / `10` | 按时间加分：30天内，按最近更新日期衰减加分，最大10分, `0` 即关闭 |
 | `path_match_bonus` | `5` | 路径命中加分：查询的每个词都出现在文档路径（含文件名）时，整篇加一次 |
 | `strip_wikilinks` | `true` | 分词前去掉 `[[...]]`，原文与偏移不变；改动会全量重建一次索引 |
+| `historical_penalty` | `0` | 历史降分：相对路径（含目录与文件名）命中任一关键字时整篇扣一次，`0` 即关闭 |
+| `historical_keywords` | `[]` | 历史标记关键字数组（≤100 条），子串匹配、不区分大小写；如 `["meeting", "已废弃"]` |
 
-- 加分只改排序，不改命中集合；不宜过大（BM25 分通常几到二十几，建议加分 ≤ 10）
-- 批量改动、同步会刷新旧文档的修改时间——这类 source（如外部同步库）设 `"recency_bonus": 0`
+- 加分/降分只改排序，不改命中集合；数值不宜过大（BM25 分通常几到二十几，建议 |分值| ≤ 10）
+- 批量改动、同步会刷新旧文档的修改时间——这类 source（如外部同步库）设 `"recency_bonus": 0`，
+  并靠 `historical_penalty` + `historical_keywords` 兜底（不依赖 mtime）
+- 历史降分默认关闭：关键字是子串匹配，任何路径含关键字（哪怕无关笔记）都会被降分，
+  开启前先在语料里 grep 误伤面
 - 想保持旧排序：`"scoring": {"recency_bonus": 0, "path_match_bonus": 0, "strip_wikilinks": false}`
 
 CLI 等价写法：`python3 config.py config edit --scoring recency_bonus=8`（全局）、
@@ -292,6 +305,63 @@ python3 config.py restart                 # 调用 run.py --restart
 > 都行；用盘符时，服务必须运行在映射了该盘符的用户下。
 > 修改类命令默认要手动 `config.py restart`，加 `--restart` 则改完直接重启。
 
+### 多人共用配置（适合≤10人小队）
+
+一个实例供小队共用：`sources` 里的为公共 source（对全部会话可见），服务器上
+一个"个人根目录"的一级子目录 = 一个用户 = 一个个人 source。身份只来自
+URL 上的 `?user=` 参数（知道用户名即可冒充——已接受的已知风险，后续收紧再议）。
+
+配置写在 `config.json` 的 `multi_user` 子项（也可只用 CLI，不必手工编辑）：
+
+```json
+{
+  "multi_user": {
+    "enabled": true,
+    "store_dir": "E:\\UserDocs",
+    "admins": ["admin"],
+    "guest_writable": false
+  }
+}
+```
+
+- `enabled`（默认 false）：多人共用总开关。缺省（或 false）时即使配了
+  `multi_user` 块也是单机形态；预配好暂不启用很常见，要开就显式 true
+  （CLI：`multi-user enable` / `multi-user disable`）。
+- `store_dir`（必填）：个人根目录，其一级子目录 = 用户 = 个人 source；
+- `admins`（可选）：管理员名单，`?user=<管理员名>` 时全域读写；
+  未显式配置时默认 `["admin"]`（默认管理员是 admin）；
+- `guest_writable`（默认 false）：访客（无 `?user=` 的匿名连接）能否写公共 source，
+  默认只读，确需匿名写入才改 true。
+
+```
+服务器（管理员本人，终端操作）            用户（每人各自）
+1. config.py source add 公共 --dir <目录> --readonly
+2. config.py multi-user set <个人根目录>    # 写 enabled: true（重启生效）
+3. config.py multi-user user add 张三   # 或手工建目录；建目录 = 开通，热生效
+4. config.py multi-user admin add admin   # 可选：默认管理员已是 admin，无需再加
+5. python run.py --background     # 启动/重启服务
+                                           MCP 客户端配置（普通用户）：
+                                           {"type": "http",
+                                            "url": "http://<服务器>:7083/mcp?user=张三"}
+                                           MCP 客户端配置（管理员）：
+                                           {"type": "http",
+                                            "url": "http://<服务器>:7083/mcp?user=李四"}
+```
+
+- 会话范围 = 全部公共 source + 本人个人 source（管理员为全域）；范围外按
+  "source 不存在"拒绝，不揭示其他用户。误拼用户名 → 400 提示。
+- `POST /reindex` 多人共用下**仅管理员**可触发（其余 403）；`config.py reindex`
+  自动携带管理员身份（`admins` 非空时取名单首个，未配置 admins 时用默认
+  admin，或用 `--user` 指定）。单机形态（开关关闭）不受限。
+- 新用户开通：服务器建目录即可，服务不重启；新管理员：`multi-user admin add` + 重启。
+- 收回用户：删目录（索引与缓存随之清除；先备份内容——无回收站）。
+- 访客（无 `?user=` 的匿名连接）：只见公共 source，默认**只读**
+  （确需匿名写入才在 `multi_user` 里设 `"guest_writable": true`）。
+- `/health` 的 `multi_user` 块按身份分层：默认只报 `store_dir`（个人根目录）与
+  `guest_writable`；`/health?user=<管理员名>` 才另给 `admins` 名单与各用户的
+  开通情况。日常开通管理仍在服务器上用 `config.py multi-user show` 与
+  `config.py multi-user user list`。
+  
 ---
 
 ## 客户端接入

@@ -1,4 +1,4 @@
-"""index 层单测：分词、检索排序、多样性约束、快照不变量、轮询重建与失败保护。"""
+﻿"""index 层单测：分词、检索排序、多样性约束、快照不变量、轮询重建与失败保护。"""
 
 import os
 import sys
@@ -286,31 +286,31 @@ def test_full_refresh_rereads_but_keeps_agent_marks(kb_root: Path):
     config = make_config(kb_root)
     first, _ = _refresh(config, {})
     key = next(iter(first))
-    marked, _ = _refresh(config, first, agent_marks={key: first[key].mtime})
-    assert marked[key].edited_by == "agent"
+    marked, _ = _refresh(config, first, agent_marks={key: (first[key].mtime, None)})
+    assert marked[key].editor == "agent"
     again, _ = _refresh(config, marked, full=True)
     assert again[key] is not marked[key], "全量必须重读"
-    assert again[key].edited_by == "agent", "全量重建不能丢 agent 标记"
+    assert again[key].editor == "agent", "全量重建不能丢 agent 标记"
 
 
 def test_offline_refresh_still_merges_agent_marks(multi_root: Path, monkeypatch):
     """掉盘时沿用旧条目也要并入 agent 标记。
 
-    标记若被当成已消费而清除，盘恢复后该文件的 edited_by 会从 agent 误标为 scan。
+    标记若被当成已消费而清除，盘恢复后该文件的 editor 会从 agent 误标为 scan。
     """
     config = multi_config(multi_root)
     first, _ = _refresh(config, {})
     key = ("team", "机制.md")
     _offline(monkeypatch, "team")
-    marked, availability = _refresh(config, first, agent_marks={key: first[key].mtime})
+    marked, availability = _refresh(config, first, agent_marks={key: (first[key].mtime, None)})
     assert availability["team"] == Availability(False, DISK_OFFLINE)
-    assert marked[key].edited_by == "agent", "掉盘沿用条目必须并入标记，维持 edited_by"
+    assert marked[key].editor == "agent", "掉盘沿用条目必须并入标记，维持 editor"
 
     # 标记已被消费清除，盘恢复后（文件未变）edited_by 仍是 agent
     monkeypatch.undo()
     back, _ = _refresh(config, marked)
     assert back[key] is marked[key]
-    assert back[key].edited_by == "agent"
+    assert back[key].editor == "agent"
 
 
 def test_read_failure_still_merges_agent_marks(kb_root: Path, monkeypatch):
@@ -326,9 +326,9 @@ def test_read_failure_still_merges_agent_marks(kb_root: Path, monkeypatch):
         return real_read(self, path)
 
     monkeypatch.setattr(storage.LocalStorage, "read_text", read_text)
-    marked, _ = _refresh(config, first, agent_marks={key: first[key].mtime})
+    marked, _ = _refresh(config, first, agent_marks={key: (first[key].mtime, None)})
     assert marked[key] is not first[key], "沿用的条目应换上标记后的新对象"
-    assert marked[key].edited_by == "agent"
+    assert marked[key].editor == "agent"
 
 
 # --- 可用性：掉盘与目录删除 ---------------------------------------------------
@@ -767,7 +767,7 @@ def test_cold_start_rescue_drops_excluded_extensions(rescue_root: Path, monkeypa
 
 
 def test_cold_start_keeps_agent_marks(rescue_root: Path):
-    """指纹不符的冷启动：在线 source 全量重读，但 edited_by 沿用旧缓存的 agent 标记。"""
+    """指纹不符的冷启动：在线 source 全量重读，但 editor 沿用旧缓存的 agent 标记。"""
     config = multi_config(rescue_root)
     holder = index.IndexHolder(config)
     holder.build_now()
@@ -775,12 +775,12 @@ def test_cold_start_keeps_agent_marks(rescue_root: Path):
     holder.mark_agent(*key, (rescue_root / "memory" / "机制.md").stat().st_mtime)
     holder.request_rebuild("save")
     _wait_idle(holder)
-    assert holder.snapshot.entries[key].edited_by == "agent"
+    assert holder.snapshot.entries[key].editor == "agent"
 
     cold = index.IndexHolder(multi_config(rescue_root, chunk_size=300))
     cold.start()
     _wait_idle(cold)
-    assert cold.snapshot.entries[key].edited_by == "agent"
+    assert cold.snapshot.entries[key].editor == "agent"
 
 
 @pytest.mark.parametrize("damage", ["garbage", "format"])
@@ -972,6 +972,101 @@ def test_source_can_disable_recency_bonus(tmp_path: Path):
     inherit, disabled = scores({}), scores({"recency_bonus": 0})
     assert round(inherit["synced"] - disabled["synced"], 6) == 10
     assert inherit["fresh"] == disabled["fresh"]
+
+
+# --- 历史关键字降分：historical_penalty / historical_keywords（ADR-0033） -------
+
+def _historical_bonus(root: Path, query: str, **fields) -> dict[str, float]:
+    """开历史降分与全关相比，每篇命中文档多出的分数（负值即扣分）。"""
+    off = _scores(root, query)
+    on = _scores(root, query, **fields)
+    assert off.keys() == on.keys(), "降分不应改变命中集合"
+    return {path: round(on[path] - off[path], 6) for path in off}
+
+
+def test_historical_penalty_when_keyword_in_path(scoring_root: Path):
+    bonus = _historical_bonus(scoring_root, "设备安全方案",
+                              historical_penalty=3, historical_keywords=["meeting", "会议"])
+    assert bonus["会议/26-07-15-跨部门同步/会议结论.md"] == -3
+    assert bonus["会议/26-07-15-跨部门同步/方案.md"] == -3
+    assert bonus["设计/设备安全方案总览.md"] == 0
+
+
+def test_historical_penalty_is_deducted_once_despite_multiple_hits(scoring_root: Path):
+    """目录名命中"会议"、文件名命中"会议结论"：同篇文档只扣一次。"""
+    bonus = _historical_bonus(scoring_root, "设备安全方案", historical_penalty=3,
+                              historical_keywords=["会议", "会议结论", "26-07-15"])
+    assert bonus["会议/26-07-15-跨部门同步/会议结论.md"] == -3
+
+
+def test_historical_penalty_is_case_insensitive(tmp_path: Path):
+    raw = tmp_path / "memory"
+    (raw / "Meeting_Docs").mkdir(parents=True)
+    (raw / "Meeting_Docs" / "旧稿.md").write_text("SecProto 机制 防护", encoding="utf-8")
+    (raw / "总览.md").write_text("SecProto 机制 防护", encoding="utf-8")
+    bonus = _historical_bonus(tmp_path, "SecProto 机制", historical_penalty=3,
+                              historical_keywords=["MEETING"])
+    assert bonus["Meeting_Docs/旧稿.md"] == -3
+    assert bonus["总览.md"] == 0
+
+
+def test_historical_penalty_zero_is_off(scoring_root: Path):
+    bonus = _historical_bonus(scoring_root, "设备安全方案",
+                              historical_penalty=0, historical_keywords=["会议"])
+    assert set(bonus.values()) == {0}
+
+
+def test_historical_penalty_keeps_hit_set_and_total(scoring_root: Path):
+    off = build_index(scoring_root, scoring=scoring()).search("设备 安全 方案", 20)
+    on = build_index(scoring_root, scoring=scoring(
+        historical_penalty=3, historical_keywords=["会议"])).search("设备 安全 方案", 20)
+    assert off[0] == on[0], "降分只改排序，命中总数不变"
+
+
+def test_historical_penalty_pushes_authority_above_stale_meeting_docs(scoring_root: Path):
+    """关键词降分后，总览应排到全部会议稿之前；分数仍降序。"""
+    _, hits = build_index(scoring_root, scoring=scoring(
+        historical_penalty=3, historical_keywords=["会议"])).search("设备安全方案", 5)
+    assert hits[0].path == "设计/设备安全方案总览.md"
+    assert [h.score for h in hits] == sorted((h.score for h in hits), reverse=True)
+
+
+def test_historical_penalty_is_independent_of_mtime(tmp_path: Path):
+    """mtime 全部相同（批量改动/拉取的典型症状）时，降分依然把历史稿压下去。"""
+    raw = tmp_path / "memory"
+    raw.mkdir()
+    bodies = {"历史稿会议/会议结论.md": "SecProto 机制 结论",
+              "SecProto机制总览.md": "SecProto 机制 结论"}
+    for rel, body in bodies.items():
+        path = raw / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        os.utime(path, (NOW, NOW))  # 全部同一个 mtime，近期加分对两篇完全相同
+
+    config = make_config(tmp_path, scoring=scoring(
+        recency_bonus=10, historical_penalty=3, historical_keywords=["会议"]))
+    _, hits = index.build(config).search("SecProto 机制", 5, now=NOW)
+    assert hits[0].path == "SecProto机制总览.md"
+
+
+def test_source_historical_penalty_applies_to_that_source_only(tmp_path: Path):
+    for name in ("kb", "notes"):
+        (tmp_path / name).mkdir()
+        path = tmp_path / name / "会议结论.md"
+        path.write_text("SecProto 机制", encoding="utf-8")
+
+    def scores(kb_scoring):
+        config = make_config(tmp_path, scoring=scoring(), sources=[
+            {"name": "kb", "dir": str(tmp_path / "kb"), "scoring": kb_scoring},
+            {"name": "notes", "dir": str(tmp_path / "notes")},
+        ])
+        _, hits = index.build(config).search("SecProto 机制", 5)
+        return {h.source: h.score for h in hits}
+
+    fields = {"historical_penalty": 3, "historical_keywords": ["会议"]}
+    off, on = scores({}), scores(fields)
+    assert round(on["kb"] - off["kb"], 6) == -3
+    assert on["notes"] == off["notes"]
 
 
 # --- strip_wikilinks：分词前整段去掉 [[...]]（等长遮罩，偏移不变） -------------

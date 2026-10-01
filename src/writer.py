@@ -14,16 +14,16 @@
 4. **同路径即覆盖**（upsert）。目标文件已存在时整篇替换，不改名、不追加、不合并。
    代价是**覆盖不可撤销且没有备份**——见 ADR-0014。为了让这件事至少是**可见的**，
    覆盖时返回 created=False 与被替换内容的长度。
-5. **rename、replace 与 merge 走同一套边界**。rename 在同 source 内改名/移一级分类，
+5. **rename、replace 走同一套边界**。rename 在同 source 内改名/移一级分类，
    目标存在即拒绝（覆盖等于把已有文件直接删掉，不可撤销）；replace 做字面
-   old→new 替换，命中 0 处或 new_string 为空一律拒绝（replace 是四者中唯一
+   old→new 替换，命中 0 处或 new_string 为空一律拒绝（replace 是二者中唯一
    支持多层分类路径的：只编辑已存在的文件，文件须人工先建好，不限制层级、
-   允许隐藏目录，只拦路径穿越与空段）；merge 把一篇已存在的
-   记忆并入另一篇并删源，并入段带来源标题。三者的源/目标文件都必须真实
-   存在；不认识索引，存在性按文件系统判断。
+   允许隐藏目录，只拦路径穿越与空段）。rename 与 replace 的源/目标文件都必须
+   真实存在；不认识索引，存在性按文件系统判断。
 6. **删除是断路器保护的能力（配置 allow_mcp_delete，默认关）**。delete 真删
-   （无备份）；merge 删源同受此闸。关闭时 server 层根本不注册这两个工具，
-   这里再拦一道——双保险必须连接到同一个开关。
+   （无备份）。merge 已移除（docs/adr/0032-remove-merge-tool.md）：合并工作流
+   走"search/get-document 读两篇 → save 合并稿 → delete 源"。关闭时 server 层
+   根本不注册 delete 工具，这里再拦一道——双保险必须连接到同一个开关。
 
 写入成功后由调用方（server.py）记下 agent 标记并触发索引刷新，本模块不认识索引。
 """
@@ -54,23 +54,9 @@ class Written:
     path: str          # 相对 source 目录的 POSIX 路径，如 "技术/协议要点.md"
     absolute: Path
     char_count: int
-    mtime: float                         # 落盘后的 mtime，用于判定 edited_by
+    mtime: float                         # 落盘后的 mtime，用于判定 editor（ADR-0031）
     created: bool                        # True=新建，False=覆盖了已有文件
     replaced_char_count: int | None      # 覆盖时为被替换内容的长度，新建时为 None
-
-
-@dataclass(frozen=True, slots=True)
-class Merged:
-    """一次成功的合并。(source, path) 是并入目标；from_path 是已删除（或删失败的）源文件。"""
-
-    source: str
-    path: str             # 目标相对路径，如 "技术/汇总.md"
-    absolute: Path
-    from_path: str        # 源相对路径，如 "工作/周报.md"
-    char_count: int       # 并入后目标全文长度
-    old_char_count: int   # 并入前目标全文长度
-    mtime: float
-    source_removed: bool  # False = 内容已并入但源文件删除失败，仍在原处
 
 
 def _normalize_stem(filename: str) -> str:
@@ -239,7 +225,7 @@ def _validate_nested_category(config: Config, category: str,
 
     replace 不新建也不移动文件，只编辑已存在的文件内容——文件是人工建好的，
     多层、隐藏目录、目录里的特殊字符都照人工的组织原样放行。路径写错的结局
-    是"文件不存在"的报错，不会越界写入。其余工具（save/rename/merge/delete）
+    是"文件不存在"的报错，不会越界写入。其余工具（save/rename/delete）
     仍走 _validate_category 的一级约定。
     这里只拒绝路径语义上会造成逃逸或歧义的东西：
       - ".." 与 "."：目录穿越/自指，任何段上出现都拒绝；
@@ -398,7 +384,7 @@ def replace_memory(config: Config, source: str, path: str,
 
 
 def _require_delete_enabled(config: Config) -> None:
-    """删除类操作（delete 真删、merge 删源）的配置闸：默认关闭。
+    """删除操作（delete 真删）的配置闸：默认关闭。
 
     工具在关闭时根本不出现在 tools/list 里，LLM 不应该走到这里；
     这道闸兜住的是绕过工具层的调用与配置回退的窗口期。
@@ -413,7 +399,7 @@ def _require_delete_enabled(config: Config) -> None:
 def delete_memory(config: Config, source: str, path: str) -> Written:
     """真删 <source>/<path>.md：unlink，不备份、不隔离（与覆盖无备份的哲学一致）。
 
-    边界口径与 rename/merge 相同：同 source、文件必须真实存在、路径走同一套
+    边界口径与 rename 相同：同 source、文件必须真实存在、路径走同一套
     白名单校验。不可恢复是刻意的——删除的豁口只该在配置里开一次，而不是靠
     运行时的花活（回收站/软删除）来消解。
     """
@@ -448,96 +434,4 @@ def delete_memory(config: Config, source: str, path: str) -> Written:
         mtime=stat.mtime,
         created=False,
         replaced_char_count=None,
-    )
-
-
-def merge_memory(config: Config, source: str, from_path: str, to_path: str) -> Merged:
-    """把 <source>/from_path.md 并入已存在的 <source>/to_path.md，然后删除源文件。
-
-    与 rename（移动）、replace（字面替换）不同，merge 改变的是目标的完整内容：
-    并入段以 "## 源文件相对路径" 起头，前面用 " --- "（前后各空一行）与原文
-    分隔——合并后仍能看出这段内容来自谁，符合"记忆要留证据"的定位。
-
-    merge 会删除源文件，因此同样受配置 allow_mcp_delete 的闸（默认关）。
-    边界口径与 rename 相同：同一 source 内；from 与 to 都必须真实存在
-    （合并不负责新建，目标为空是 save 的事）；from 与 to 相同直接拒绝。
-    删除在并入成功之后做，删除失败不回滚、不误报失败——响应里会标 source_removed。
-    """
-    _require_delete_enabled(config)
-
-    name = (source or "").strip()
-    if not name:
-        raise WriteError("source 不能为空。可写的 source 见 list-sources。")
-    target = _writable_target(config, name)
-
-    from_relative = _normalize_path(from_path or "")
-    if not from_relative:
-        raise WriteError("from_path 不能为空。传 search/recent 返回的 path 即可，.md 可带可不带。")
-    to_relative = _normalize_path(to_path or "")
-    if not to_relative:
-        raise WriteError("to_path 不能为空。传合并目标的 path 即可，.md 可带可不带。")
-
-    from_category, from_stem = _validate_location(
-        config, *_split(from_relative), which="from_path")
-    to_category, to_stem = _validate_location(
-        config, *_split(to_relative), which="to_path")
-
-    from_relative = f"{from_category}/{from_stem}{EXTENSION}" if from_category else f"{from_stem}{EXTENSION}"
-    to_relative = f"{to_category}/{to_stem}{EXTENSION}" if to_category else f"{to_stem}{EXTENSION}"
-    if from_relative == to_relative:
-        raise WriteError(f"from_path 与 to_path 相同：{to_relative!r}，无法自己并入自己。")
-
-    storage = open_storage(target)
-    if storage.stat(to_relative) is None:
-        raise WriteError(
-            f"目标文件不存在：{name}/{to_relative}。merge 只并入已有记忆，"
-            f"新建一篇用 save。"
-        )
-    if storage.stat(from_relative) is None:
-        raise WriteError(f"源文件不存在：{name}/{from_relative}。先 search 确认实际路径。")
-
-    try:
-        target_content = storage.read_text(to_relative)
-        from_content = storage.read_text(from_relative)
-    except OSError as exc:
-        raise WriteError(f"读取失败：{name}（{exc}）") from exc
-    if not from_content.strip():
-        raise WriteError(f"源文件是空的：{name}/{from_relative}，没有可并入的内容。")
-
-    # 标题用源文件去掉 .md 的完整路径："工作/周会纪要"，跨分类合并时仍能追溯出处。
-    heading = f"## {from_relative[: -len(EXTENSION)]}"
-    body = from_content.strip("\n")
-    if target_content.strip():
-        updated = target_content.rstrip("\n") + "\n\n---\n\n" + heading + "\n\n" + body + "\n"
-    else:
-        updated = heading + "\n\n" + body + "\n"
-
-    replaced_char_count = len(target_content)
-    try:
-        stat = storage.write_text(to_relative, updated)
-    except OSError as exc:
-        raise WriteError(f"写入失败：{name}/{to_relative}（{exc}）") from exc
-
-    # 先并入、后删源：删除失败时内容已经安全落在目标里，
-    # 不能把这次合并报成失败，交给响应体的 source_removed 提示。
-    source_removed = True
-    try:
-        storage.remove(from_relative)
-    except OSError as exc:
-        source_removed = False
-        logger.warning("合并成功但删除源文件失败 %s/%s: %s", name, from_relative, exc)
-
-    logger.info(
-        "已合并记忆 %s/%s → %s（源%s）", name, from_relative, to_relative,
-        "已删除" if source_removed else "删除失败，仍在原处",
-    )
-    return Merged(
-        source=name,
-        path=to_relative,
-        absolute=target.dir.joinpath(*to_relative.split("/")),
-        from_path=from_relative,
-        char_count=len(updated),
-        old_char_count=replaced_char_count,
-        mtime=stat.mtime,
-        source_removed=source_removed,
     )

@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 CONFIG_ENV = "MEMORY_CONFIG"
 # 运行时数据目录：配置、索引缓存、日志。不放在代码目录里，免得污染仓库。
@@ -72,6 +75,11 @@ DEFAULTS: dict[str, Any] = {
     # 默认 False：删除不可备份不可恢复，关闭时这两个工具对 AI 彻底隐藏，
     # 要开启需人工改配置并重启——这是心智上的断路器，不是运行时开关。
     "allow_mcp_delete": False,
+    # 多人共用形态（docs/adr/0028 ~ 0031）：store_dir 必填、admins 可选
+    # （缺省时默认 ["admin"]）、guest_writable 默认 false（访客对公共 source
+    # 一律只读）。enabled 是显式开关，默认 false：multi_user 块可以预先配好
+    # 而不启用——只有 enabled = true 才进入多人共用形态。
+    "multi_user": None,
     # BM25 之外的打分调整，全局一份，source 可按字段覆盖
     # （docs/adr/0027-search-scoring-adjustments.md）。
     "scoring": {
@@ -79,6 +87,9 @@ DEFAULTS: dict[str, Any] = {
         "recency_bonus": 10,
         "path_match_bonus": 5,
         "strip_wikilinks": True,
+        # 历史文档降分（docs/adr/0033）：相对路径含任一关键字时扣分，默认关闭。
+        "historical_penalty": 0,
+        "historical_keywords": [],
     },
 }
 
@@ -161,13 +172,17 @@ def _real_dir(directory: Path) -> Path:
 class Scoring:
     """一个 source 的有效打分调整（全局值与 source 覆盖按字段合并后的结果）。
 
-    recency_*、path_match_bonus 在查询时叠加到 BM25 分上；strip_wikilinks 在建索引时生效。
+    recency_*、path_match_bonus 在查询时叠加到 BM25 分上；strip_wikilinks 在建索引时生效；
+    historical_* 在查询时按路径命中扣分（docs/adr/0033）。historical_keywords 存储为
+    strip + lower + 去重后的 tuple，匹配端不再转小写。
     """
 
     recency_window_days: int = DEFAULTS["scoring"]["recency_window_days"]
     recency_bonus: float = DEFAULTS["scoring"]["recency_bonus"]
     path_match_bonus: float = DEFAULTS["scoring"]["path_match_bonus"]
     strip_wikilinks: bool = DEFAULTS["scoring"]["strip_wikilinks"]
+    historical_penalty: float = DEFAULTS["scoring"]["historical_penalty"]
+    historical_keywords: tuple[str, ...] = tuple(DEFAULTS["scoring"]["historical_keywords"])
 
 
 def parse_scoring(raw: Any, base: Scoring, where: str = "scoring") -> Scoring:
@@ -189,12 +204,21 @@ def parse_scoring(raw: Any, base: Scoring, where: str = "scoring") -> Scoring:
         elif key == "recency_window_days":
             ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
             expect = "非负整数"
+        elif key == "historical_keywords":
+            ok = (isinstance(value, list) and len(value) <= 100
+                  and all(isinstance(kw, str) and kw.strip() for kw in value))
+            expect = "非空字符串数组（≤100 条）"
         else:
             ok = isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
             expect = "非负数"
         if not ok:
             raise ConfigError(f"{where}.{key} 必须是{expect}，当前值：{value!r}")
-    return dataclasses.replace(base, **raw)
+    fields = dict(raw)
+    keywords = fields.get("historical_keywords")
+    if keywords is not None:
+        fields["historical_keywords"] = tuple(dict.fromkeys(
+            kw.strip().lower() for kw in keywords))
+    return dataclasses.replace(base, **fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,14 +250,24 @@ class Source:
         return body
 
 
-def parse_sources(raw: Any) -> tuple[Source, ...]:
+def parse_sources(raw: Any, *, allow_empty: bool = False) -> tuple[Source, ...]:
     """校验 sources 列表：名称、重名、类型、字段、不重叠不嵌套。
 
     **不检查目录是否存在**：目录访问不到（掉盘或被删除）时服务照常启动，只给警告
     （需求 §8）。路径拼错由 CLI 添加时校验目录存在来拦截。
+    allow_empty 仅在 multi_user 启用（enabled: true）时由调用方传入：
+    团队形态可以没有公共 source，语料 = 个人根目录派生的个人 source。
     """
-    if not isinstance(raw, list) or not raw:
+    if raw is not None and not isinstance(raw, list):
         raise ConfigError("sources 必须是非空数组，至少配置一个 source")
+    if not raw and not allow_empty:
+        raise ConfigError(
+            "sources 必须是非空数组，至少配置一个 source"
+            + ("（团队共用形态没有公共 source 时语料来自个人根目录的子文件夹）"
+               if raw is not None else "")
+        )
+    if not raw:
+        return ()
 
     sources: list[Source] = []
     seen: set[str] = set()
@@ -280,6 +314,216 @@ def parse_sources(raw: Any) -> tuple[Source, ...]:
                     f"source {a.name}（{a.dir}）与 {b.name}（{b.dir}）的目录重叠或嵌套"
                 )
     return tuple(sources)
+
+
+# --- 多人共用（docs/adr/0028 ~ 0031） ----------------------------------------
+
+# editor 的保留取值（ADR-0031）：不得用作个人目录名与管理员名。
+# 比较大小写不敏感（casefold）——Windows 目录名不区分大小写。
+EDITOR_RESERVED_NAMES = frozenset({"agent", "scan", "guest"})
+
+_USER_MAX_LEN = 64
+
+
+def _has_control_char(name: str) -> bool:
+    """传输层硬约束：控制字符（CR/LF/NUL 等）会让注入的请求头被拆行/截断。"""
+    return any(ord(ch) < 0x20 or ch == "\x7f" for ch in name)
+
+
+def _is_editor_reserved(name: str) -> bool:
+    return name.casefold() in EDITOR_RESERVED_NAMES
+
+
+@dataclass(frozen=True, slots=True)
+class MultiUserConfig:
+    """多人共用形态的配置子项。enabled = true 才进入本形态；
+    不配置或开关关闭（enabled 默认 false）= 单机形态，行为与从前一致。"""
+
+    store_dir: Path
+    admins: tuple[str, ...] = ()
+    guest_writable: bool = False
+
+
+def parse_multi_user(raw: Any, sources: tuple[Source, ...]) -> MultiUserConfig:
+    """校验 multi_user 子项；未配置或开关关闭（None / enabled=false）返回 None，即单机形态。
+
+    - enabled：布尔开关，**默认 false**——multi_user 块可预先写好而不启用，
+      只有显式 enabled = true 才进入多人共用形态。
+    - store_dir 必填：字符串、非空，补绝对路径，不解析符号链接（与 source dir 同口径）。
+    - **不要求目录存在**（与 sources 一致，需求 §8）：目录不在 = 0 个用户，启动警告，服务照常。
+    - admins：字符串数组，strip 后入表、去重、空串剔除并警告；不做 source 命名
+      白名单校验（管理员是纯授权身份，ADR-0030）。硬约束三条都是传输层底线
+      （管理员名要经 `?user=` 逐字匹配后注入请求头）：无控制字符、长度 ≤64、
+      不得为编辑者保留字（casefold）。**未显式给出 admins 时默认 ["admin"]**；
+      显式给出（含空数组）则完全按给定值。
+    - guest_writable：布尔，默认 false（访客对公共 source 一律只读，ADR-0030 修订）。
+    - 嵌套禁令扩展：store_dir 与任何公共 source 目录不得互相包含。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("multi_user 必须是对象")
+    unknown = set(raw) - {"store_dir", "admins", "guest_writable", "enabled"}
+    if unknown:
+        raise ConfigError(f"multi_user 含未知字段：{', '.join(sorted(unknown))}")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("multi_user.enabled 必须是 true 或 false")
+    if not enabled:
+        logger.info("multi_user 已配置但 enabled = false，多人共用未启用（单机形态）")
+        return None
+
+    raw_root = raw.get("store_dir")
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        raise ConfigError("multi_user 缺少 store_dir（个人根目录，多人共用形态必填）")
+    store_dir = Path(os.path.abspath(Path(raw_root.strip()).expanduser()))
+
+    if not store_dir.is_dir():
+        logger.warning(
+            "multi_user.store_dir 当前不存在：%s（0 个用户；目录建好后即刻生效，无需重启）",
+            store_dir,
+        )
+
+    if "admins" in raw:
+        raw_admins = raw["admins"]
+    else:
+        # 默认管理员是 admin（未显式给出名单时）；显式给出（含空数组）则完全按给定值。
+        raw_admins = ["admin"]
+    if not isinstance(raw_admins, list) or not all(isinstance(a, str) for a in raw_admins):
+        raise ConfigError("multi_user.admins 必须是字符串数组")
+    admins: list[str] = []
+    for item in raw_admins:
+        name = item.strip()
+        if not name:
+            logger.warning("multi_user.admins 含空白名字，已剔除")
+            continue
+        if _has_control_char(name):
+            raise ConfigError(f"multi_user.admins 含控制字符，非法：{item!r}")
+        if len(name) > _USER_MAX_LEN:
+            raise ConfigError(
+                f"multi_user.admins 名字过长（上限 {_USER_MAX_LEN} 字符）：{name[:20]}…"
+            )
+        if _is_editor_reserved(name):
+            raise ConfigError(
+                f"multi_user.admins 不得使用编辑者保留字（不区分大小写）：{name!r}。"
+                f"保留字：{', '.join(sorted(EDITOR_RESERVED_NAMES))}"
+            )
+        if name in admins:
+            logger.warning("multi_user.admins 含重复名字：%s，已去重", name)
+            continue
+        admins.append(name)
+
+    guest_writable = raw.get("guest_writable", False)
+    if not isinstance(guest_writable, bool):
+        raise ConfigError("multi_user.guest_writable 必须是 true 或 false")
+
+    # 嵌套禁令：store_dir 与公共 source 目录不得互相包含（复用 parse_sources 的口径）。
+    real_root = _real_dir(store_dir)
+    for ws in sources:
+        real_src = _real_dir(ws.dir)
+        if _contains(real_root, real_src) or _contains(real_src, real_root):
+            raise ConfigError(
+                f"source {ws.name}（{ws.dir}）与个人根目录（{store_dir}）的目录重叠或嵌套"
+            )
+
+    return MultiUserConfig(store_dir=store_dir,
+                           admins=tuple(admins), guest_writable=guest_writable)
+
+
+def _derive_personal(store_dir: Path,
+                     static_names: tuple[Source, ...]) -> tuple[tuple[Source, ...], list[dict[str, str]]]:
+    """枚举个人根目录的一级子目录，派生个人 source 并过滤非法名字。
+
+    返回 (派生的 source 全集, 被跳过的 [{name, reason}])。跳过只警告不报错，
+    不挡启动（与"目录不存在不阻止启动"的宽容语义一致，需求 §8）。
+    过滤规则（docs/adr/0029 / SPEC §3.3）：
+    a. 目录名不匹配 source 名白名单（含空格、点等）；
+    b. 与公共 source 名重名（casefold——Windows 目录名不区分大小写）；
+    c. 编辑者保留字 agent/scan/guest（casefold，ADR-0031）；
+    d. 与已派生的个人 source 重名（casefold；Linux 上 Alice/alice 可并存，留其一）。
+    """
+    derived: list[Source] = []
+    skipped: list[dict[str, str]] = []
+    taken: set[str] = {ws.name.casefold() for ws in static_names}
+    try:
+        entries = list(os.scandir(store_dir))
+    except OSError as exc:
+        logger.warning("枚举个人根目录失败 %s：%s（按 0 个用户处理）", store_dir, exc)
+        return (), []
+    for entry in entries:
+        name = entry.name
+        if not entry.is_dir():
+            continue
+        if not _SOURCE_NAME_PATTERN.match(name):
+            skipped.append({"name": name, "reason": "invalid_name"})
+            logger.warning(
+                "个人目录 %s 的名字不合法（只允许中英文、数字、下划线与连字符，长度 1-%d），已跳过",
+                name, _USER_MAX_LEN,
+            )
+        elif _is_editor_reserved(name):
+            skipped.append({"name": name, "reason": "reserved"})
+            logger.warning(
+                "个人目录 %s 与编辑者保留字冲突（%s），已跳过，请改名",
+                name, ", ".join(sorted(EDITOR_RESERVED_NAMES)),
+            )
+        elif name.casefold() in taken:
+            skipped.append({"name": name, "reason": "name_conflict"})
+            logger.warning("个人目录 %s 与现有 source 重名，已跳过，请改名", name)
+        else:
+            taken.add(name.casefold())
+            derived.append(Source(
+                name=name,
+                dir=store_dir / name,
+                type="local",
+                writable=True,
+                description=f"个人记忆源（经 ?user={name} 路由）",
+            ))
+    return tuple(derived), skipped
+
+
+def personal_sources_report(store_dir: Path,
+                            static_names: tuple[Source, ...]) -> tuple[tuple[Source, ...], list[dict[str, str]]]:
+    """派生全集与跳过明细（/health 与 CLI `multi-user user list` 用）。"""
+    return _derive_personal(store_dir, static_names)
+
+
+def personal_sources(store_dir: Path,
+                     static_names: tuple[Source, ...]) -> tuple[Source, ...]:
+    """个人根目录下的一级子目录派生的个人 source 全集（跳过项只记日志）。"""
+    return _derive_personal(store_dir, static_names)[0]
+
+
+def effective_sources(config: "Config") -> tuple[Source, ...]:
+    """公共 + 全部派生个人 source：索引层（构建/刷新/缓存）的输入。
+
+    每次调用当场枚举（ADR-0029 决策二）：新用户目录的出现/消失/改名由下一轮
+    刷新自然消化，无需重启、无需指纹。
+    """
+    if config.multi_user is None:
+        return config.sources
+    return config.sources + personal_sources(
+        config.multi_user.store_dir, config.sources)
+
+
+def find_user(config: "Config", name: str) -> Source | None:
+    """名字逐字相等的个人 source；无 → None（strip 由调用方统一做，§3.4）。"""
+    if config.multi_user is None:
+        return None
+    for src in personal_sources(config.multi_user.store_dir, config.sources):
+        if src.name == name:
+            return src
+    return None
+
+
+def is_admin(config: "Config", name: str) -> bool:
+    """名字与管理员名单逐字相等（strip 由调用方统一做，§3.4）。
+
+    无目录要求、无命名白名单校验——校验在配置加载时做（parse_multi_user）。
+    """
+    if config.multi_user is None:
+        return False
+    return name in config.multi_user.admins
 
 
 def resolve_config_path(environ: dict[str, str] | None = None) -> Path:
@@ -380,6 +624,7 @@ class Config:
     max_query_chars: int = field(default=500)
     domain_terms: tuple[str, ...] = field(default=())
     allow_mcp_delete: bool = field(default=False)
+    multi_user: MultiUserConfig | None = field(default=None)
     scoring: Scoring = field(default_factory=Scoring)
 
     @classmethod
@@ -402,7 +647,12 @@ class Config:
         if unknown:
             raise ConfigError(f"配置含未知字段：{', '.join(sorted(unknown))}")
 
-        sources = parse_sources(data.get("sources"))
+        # 先看 multi_user 开关再校验 sources：团队形态（enabled: true）允许
+        # 没有公共 source——语料 = 个人根目录派生的个人 source。
+        raw_multi_user = data.get("multi_user")
+        team_mode = isinstance(raw_multi_user, dict) and raw_multi_user.get("enabled", False) is True
+
+        sources = parse_sources(data.get("sources"), allow_empty=team_mode)
 
         raw_ext = data.get("extensions", DEFAULTS["extensions"])
         if not isinstance(raw_ext, list) or not raw_ext or not all(
@@ -433,12 +683,14 @@ class Config:
         if not isinstance(allow_mcp_delete, bool):
             raise ConfigError("allow_mcp_delete 必须是 true 或 false")
 
+        multi_user = parse_multi_user(raw_multi_user, sources)
+
         # 全局值在默认值之上覆盖，source 再在全局值之上按字段覆盖。
         scoring = parse_scoring(data.get("scoring"), Scoring())
         sources = tuple(
             dataclasses.replace(src, scoring=parse_scoring(
                 item.get("scoring"), scoring, where=f"source {src.name} 的 scoring"))
-            for src, item in zip(sources, data["sources"])
+            for src, item in zip(sources, data.get("sources") or [])
         )
 
         chunk_size = _int_field(data, "chunk_size")
@@ -465,6 +717,7 @@ class Config:
             max_cached_docs=_int_field(data, "max_cached_docs"),
             domain_terms=domain_terms,
             allow_mcp_delete=allow_mcp_delete,
+            multi_user=multi_user,
             scoring=scoring,
         )
 

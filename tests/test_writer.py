@@ -1,4 +1,4 @@
-"""writer 层与 create 工具：写入边界、不覆盖、异步刷新。
+﻿"""writer 层与 create 工具：写入边界、不覆盖、异步刷新。
 
 写入是本服务唯一一条能改变磁盘状态的路径，因此这里的每一条用例
 都对应一条明确的边界，而不是"覆盖率"。
@@ -11,8 +11,8 @@ import pytest
 
 import index
 from index import IndexHolder
-from server import run_delete, run_merge, run_rename, run_replace, run_save, run_search
-from writer import (WriteError, delete_memory, merge_memory, rename_memory,
+from server import run_delete, run_rename, run_replace, run_save, run_search
+from writer import (WriteError, delete_memory, rename_memory,
                     replace_memory, save_memory)
 
 from test_corpus import make_config
@@ -20,7 +20,7 @@ from test_corpus import make_config
 
 @pytest.fixture
 def config(tmp_path: Path):
-    """写操作通用配置：allow_mcp_delete=True，供 rename/merge/delete用例直接使用。
+    """写操作通用配置：allow_mcp_delete=True，供 rename/delete 用例直接使用。
 
     删除开关默认关闭的行为在 config_nodelete / delete 专用用例里单测，
     这里保持生活场景（人类已人工开闸）。
@@ -36,7 +36,7 @@ def config(tmp_path: Path):
 
 @pytest.fixture
 def config_nodelete(tmp_path: Path):
-    """删除封闭（默认配置）环境：验证 delete 未开启、merge 删源不可用。"""
+    """删除封闭（默认配置）环境：验证 delete 未开启、写拒绝路径可用。"""
     for name in ("memory", "team"):
         (tmp_path / name).mkdir()
     return make_config(tmp_path, sources=[
@@ -278,11 +278,11 @@ def test_run_save_marks_agent_in_index_and_cache(config):
     holder.build_now()
     run_save(config, holder, "team", "", "记录", "内容")
     assert _wait_for(lambda: ("team", "记录.md") in holder.snapshot.entries and not holder.rebuilding)
-    assert holder.snapshot.entries[("team", "记录.md")].edited_by == "agent"
+    assert holder.snapshot.entries[("team", "记录.md")].editor == "agent"
     assert not (config.config_file.parent / "status.json").exists()
 
     from index import load_cache
-    assert load_cache(config).entries[("team", "记录.md")].edited_by == "agent", "重启后仍然是 agent"
+    assert load_cache(config).entries[("team", "记录.md")].editor == "agent", "重启后仍然是 agent"
 
 
 def test_save_to_unavailable_source_is_rejected_without_recreating_dir(config):
@@ -473,7 +473,7 @@ def test_rename_marks_agent_on_new_path(config):
     run_rename(config, holder, "memory", "技术/被改名.md", "技术/改名后")
     assert _wait_for(lambda: ("memory", "技术/改名后.md") in holder.snapshot.entries
                      and not holder.rebuilding)
-    assert holder.snapshot.entries[("memory", "技术/改名后.md")].edited_by == "agent"
+    assert holder.snapshot.entries[("memory", "技术/改名后.md")].editor == "agent"
 
 
 # --- replace：字面替换 -------------------------------------------------------
@@ -531,7 +531,7 @@ def test_run_replace_returns_count_and_marks_agent(config):
     assert payload["path"] == "技术/计处.md"
     assert payload["index_refresh"] in {"started", "merged"}
     assert _wait_for(lambda: not holder.rebuilding)
-    assert holder.snapshot.entries[("memory", "技术/计处.md")].edited_by == "agent"
+    assert holder.snapshot.entries[("memory", "技术/计处.md")].editor == "agent"
 
 
 def test_run_replace_reports_error_without_raising(config):
@@ -603,129 +603,6 @@ def test_replace_nested_keeps_save_one_level(config):
     """同一台机器上，save 对同样的嵌套路径仍然拒绝——只有 replace 放开。"""
     with pytest.raises(WriteError, match="分类只有一级"):
         save_memory(config, "memory", "技术/协议", "文件", "内容")
-
-
-# --- merge：并入目标并删源 ---------------------------------------------------
-
-def test_merge_appends_to_existing_file_with_source_heading(config):
-    save_memory(config, "memory", "技术", "乙", "乙的原文。")
-    save_memory(config, "memory", "工作", "甲", "甲的原文。")
-    merged = merge_memory(config, "memory", "工作/甲.md", "技术/乙.md")
-    assert merged.path == "技术/乙.md"
-    assert merged.from_path == "工作/甲.md"
-    assert not (root(config) / "工作" / "甲.md").exists(), "并入成功后源文件必须删除"
-    content = (root(config) / "技术" / "乙.md").read_text(encoding="utf-8")
-    assert content == "乙的原文。\n\n---\n\n## 工作/甲\n\n甲的原文。\n"
-    assert merged.char_count == len(content)
-    assert merged.old_char_count == len("乙的原文。\n")
-
-
-def test_merge_into_empty_target_omits_separator(config):
-    """目标可以是空文件（人在编辑器里先建了壳），此时不加分隔线。"""
-    (root(config) / "汇总.md").write_text("", encoding="utf-8")
-    save_memory(config, "memory", "杂记", "碎片", "内容。")
-    merge_memory(config, "memory", "杂记/碎片.md", "汇总.md")
-    content = (root(config) / "汇总.md").read_text(encoding="utf-8")
-    assert content == "## 杂记/碎片\n\n内容。\n"
-
-
-def test_merge_target_must_exist(config):
-    save_memory(config, "memory", "技术", "源件", "内容。")
-    with pytest.raises(WriteError, match="目标文件不存在"):
-        merge_memory(config, "memory", "技术/源件.md", "技术/没有.md")
-    assert (root(config) / "技术" / "源件.md").exists(), "失败不得删源"
-
-
-def test_merge_missing_source_is_rejected(config):
-    save_memory(config, "memory", "技术", "靶件", "内容。")
-    with pytest.raises(WriteError, match="源文件不存在"):
-        merge_memory(config, "memory", "技术/没有.md", "技术/靶件.md")
-    assert (root(config) / "技术" / "靶件.md").read_text(encoding="utf-8") == "内容。\n"
-
-
-def test_merge_same_path_is_rejected(config):
-    save_memory(config, "memory", "技术", "原地", "内容。")
-    with pytest.raises(WriteError, match="自己并入自己"):
-        merge_memory(config, "memory", "技术/原地.md", "技术/原地.md")
-
-
-def test_merge_empty_source_is_rejected(config):
-    save_memory(config, "memory", "技术", "靶件", "内容。")
-    (root(config) / "技术" / "空的.md").write_text("   \n  ", encoding="utf-8")
-    with pytest.raises(WriteError, match="源文件是空的"):
-        merge_memory(config, "memory", "技术/空的.md", "技术/靶件.md")
-    assert (root(config) / "技术" / "空的.md").exists()
-    assert (root(config) / "技术" / "靶件.md").read_text(encoding="utf-8") == "内容。\n"
-
-
-def test_merge_illegal_or_traversal_paths_are_rejected(config):
-    save_memory(config, "memory", "技术", "原名", "内容。")
-    before = sorted(str(p) for p in root(config).rglob("*"))
-    for bad_from, bad_to in (("../外面.md", "技术/原名.md"),
-                             ("技术/原名.md", "a/b/c.md"),
-                             ("技术/原名.md", "CON")):
-        with pytest.raises(WriteError):
-            merge_memory(config, "memory", bad_from, bad_to)
-    assert sorted(str(p) for p in root(config).rglob("*")) == before
-
-
-def test_merge_into_readonly_source_is_rejected(config):
-    (config.source("org").dir / "制度.md").write_text("制度。", encoding="utf-8")
-    with pytest.raises(WriteError, match="只读"):
-        merge_memory(config, "org", "制度.md", "别处.md")
-    assert (config.source("org").dir / "制度.md").exists()
-
-
-def test_run_merge_reports_result_and_refresh(config):
-    holder = IndexHolder(config)
-    holder.build_now()
-    run_save(config, holder, "memory", "技术", "靶子", "保住正文。")
-    run_save(config, holder, "memory", "工作", "并件", "并入正文。")
-    assert _wait_for(lambda: ("memory", "工作/并件.md") in holder.snapshot.entries
-                     and not holder.rebuilding)
-    payload = run_merge(config, holder, "memory", "工作/并件.md", "技术/靶子.md")
-    assert payload["merged"] is True
-    assert payload["from_path"] == "工作/并件.md"
-    assert payload["path"] == "技术/靶子.md"
-    assert payload["source_removed"] is True
-    assert payload["old_char_count"] == len("保住正文。\n")
-    assert payload["index_refresh"] in {"started", "merged"}
-    assert _wait_for(lambda: ("memory", "工作/并件.md") not in holder.snapshot.entries
-                     and not holder.rebuilding), "刷新后源条目必须从索引里消失"
-    assert ("memory", "技术/靶子.md") in holder.snapshot.entries
-    assert not (root(config) / "工作" / "并件.md").exists()
-
-
-def test_run_merge_reports_error_without_raising(config):
-    holder = IndexHolder(config)
-    holder.build_now()
-    payload = run_merge(config, holder, "memory", "工作/没有.md", "技术/没有.md")
-    assert payload["merged"] is False
-    assert "目标文件不存在" in payload["error"]
-    assert payload["writable_sources"] == ["memory", "team"]
-
-
-def test_merge_marks_agent_on_target(config):
-    holder = IndexHolder(config)
-    holder.build_now()
-    run_save(config, holder, "memory", "技术", "靶c", "目标内容。")
-    run_save(config, holder, "memory", "工作", "源c", "源内容。")
-    assert _wait_for(lambda: ("memory", "工作/源c.md") in holder.snapshot.entries
-                     and not holder.rebuilding)
-    run_merge(config, holder, "memory", "工作/源c.md", "技术/靶c.md")
-    assert _wait_for(lambda: not holder.rebuilding)
-    assert holder.snapshot.entries[("memory", "技术/靶c.md")].edited_by == "agent"
-
-
-def test_merge_is_blocked_when_delete_capability_off(config_nodelete):
-    """merge 会删源，因此整个工具受 allow_mcp_delete 一刀切——不开就是不能用。"""
-    save_memory(config_nodelete, "memory", "技术", "承接者", "内容。")
-    save_memory(config_nodelete, "memory", "工作", "被合并", "内容。")
-    with pytest.raises(WriteError, match="删除能力未开启"):
-        merge_memory(config_nodelete, "memory", "工作/被合并.md", "技术/承接者.md")
-    assert (config_nodelete.source("memory").dir / "工作" / "被合并.md").exists()
-    assert (config_nodelete.source("memory").dir / "技术" / "承接者.md").read_text(
-        encoding="utf-8") == "内容。\n"
 
 
 # --- delete：真删 + 断路器 ---------------------------------------------------

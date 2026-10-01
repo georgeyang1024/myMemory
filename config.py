@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """config.py —— myMemory 的配置管理工具（人工操作）。
 
 只依赖 Python 标准库，不需要虚拟环境。
@@ -14,6 +14,16 @@
     python config.py source edit <name> [--name <新名>] [--dir <新目录>] [--readonly | --writable]
                                     [--desc "..."] [--restart]
     python config.py source remove <name> [--yes] [--restart]
+    python config.py multi-user set <个人根目录> [--restart]     # 启用多人共用（重启生效）
+    python config.py multi-user enable [--restart]               # 打开开关（重启生效）
+    python config.py multi-user disable [--restart]              # 关闭开关（其余配置保留）
+    python config.py multi-user unset [--restart]                # 移除多人共用
+    python config.py multi-user show                             # 配置与生效状态
+    python config.py multi-user admin add <名字> [--restart]     # 管理员名单（重启生效）
+    python config.py multi-user admin remove <名字> [--restart]
+    python config.py multi-user admin list
+    python config.py multi-user user list                         # 枚举用户目录（排障）
+    python config.py multi-user user add <名字>                   # 开通用户（建目录，热生效）
     python config.py config set poll_interval <秒> [--restart]
     python config.py config set max_cached_docs <篇数> [--restart]
     python config.py config edit --scoring <字段>=<值> [--scoring ...]
@@ -38,6 +48,7 @@ import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -53,9 +64,12 @@ from config import (  # noqa: E402
     ConfigError,
     bootstrap_config_data,
     bootstrap_config_data_with_source,
+    personal_sources_report,
     read_config_data,
     resolve_config_path,
+    validate_source_name,
     write_json_atomic,
+    _is_editor_reserved,
 )
 
 # 可经 CLI 设置的配置项。其余配置请直接编辑 config.json（需求 §5）。
@@ -66,7 +80,7 @@ SETTABLE = {
 }
 # 配置项 → (含义, 开启时的后果)：布尔开关，取值 true/false。
 SETTABLE_BOOLS = {
-    "allow_mcp_delete": ("AI 能否删除记忆", "delete 工具与 merge 删源对 AI 开放"),
+    "allow_mcp_delete": ("AI 能否删除记忆", "delete 工具对 AI 开放"),
 }
 # 打分调整（ADR-0027）：全局用 config edit --scoring，单个 source 用 source edit --scoring，写法相同。
 SCORING_FIELDS = tuple(DEFAULTS["scoring"])
@@ -134,6 +148,9 @@ def parse_scoring_value(field: str, raw: str) -> Any:
             return int(text)
         except ValueError as exc:
             raise CliError(f"{field} 必须是整数（天），当前值：{raw!r}") from exc
+    if field == "historical_keywords":
+        # 逗号分隔；各项 strip，丢空项；范围（非空、条数）由保存前的完整校验把关。
+        return [item.strip() for item in text.split(",") if item.strip()]
     try:
         value = float(text)
     except ValueError as exc:
@@ -142,8 +159,13 @@ def parse_scoring_value(field: str, raw: str) -> Any:
 
 
 def format_scoring(overrides: dict[str, Any]) -> str:
-    return ", ".join(f"{k}={str(v).lower() if isinstance(v, bool) else v}"
-                     for k, v in overrides.items())
+    def render(value: Any) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, list):
+            return ",".join(str(item) for item in value)
+        return str(value)
+    return ", ".join(f"{k}={render(v)}" for k, v in overrides.items())
 
 
 def rebuild_note(fields) -> None:
@@ -347,6 +369,174 @@ def config_set(path: Path, args: argparse.Namespace) -> int:
     return finish(path, args)
 
 
+# --- 多人共用与用户 -----------------------------------------------------------
+
+def _mu_raw_enabled(data: dict[str, Any]) -> bool:
+    """multi_user 块存在且开关打开（enabled 默认 false）。"""
+    mu = data.get("multi_user")
+    return isinstance(mu, dict) and bool(mu.get("enabled", False))
+
+
+def _require_multi_user(data: dict[str, Any]) -> dict[str, Any]:
+    mu = data.get("multi_user")
+    if not isinstance(mu, dict):
+        raise CliError("尚未启用多人共用：先执行 python config.py multi-user set <个人根目录>")
+    return mu
+
+
+def multi_user_set(path: Path, args: argparse.Namespace) -> int:
+    data = copy.deepcopy(load(path))
+    mu = data.setdefault("multi_user", {})
+    mu["enabled"] = True
+    mu["store_dir"] = absolute_dir(args.dir)
+    if getattr(args, "guest_writable", None):
+        mu["guest_writable"] = True
+    save(path, data)
+    say(f"已启用多人共用（enabled = true）：个人根目录 {mu['store_dir']}"
+        + ("；访客可写公共 source" if mu.get("guest_writable") else "；访客对公共 source 只读（默认）"))
+    return finish(path, args)
+
+
+def multi_user_enable(path: Path, args: argparse.Namespace) -> int:
+    data = copy.deepcopy(load(path))
+    mu = _require_multi_user(data)
+    if not mu.get("store_dir"):
+        raise CliError("multi_user 缺少 store_dir：先执行 python config.py multi-user set <目录>")
+    mu["enabled"] = True
+    save(path, data)
+    say(f"已打开多人共用开关（enabled = true）：个人根目录 {mu['store_dir']}")
+    return finish(path, args)
+
+
+def multi_user_disable(path: Path, args: argparse.Namespace) -> int:
+    data = copy.deepcopy(load(path))
+    mu = _require_multi_user(data)
+    mu["enabled"] = False
+    save(path, data)
+    say("已关闭多人共用开关（enabled = false，单机形态；其余 multi_user 配置保留，重启生效）")
+    return finish(path, args)
+
+
+def multi_user_unset(path: Path, args: argparse.Namespace) -> int:
+    data = copy.deepcopy(load(path))
+    if not isinstance(data.get("multi_user"), dict):
+        say("multi_user 未配置，无需移除")
+        return 0
+    del data["multi_user"]
+    save(path, data)
+    say("已移除多人共用形态，回到单机（个人 source 不再经 ?user= 路由）")
+    return finish(path, args)
+
+
+def multi_user_show(path: Path, _args: argparse.Namespace) -> int:
+    data = read_config_data(path) if path.exists() else None
+    if not data:
+        raise CliError(f"配置文件不存在：{path}")
+    config = Config.from_data(data, config_file=path)
+    if config.multi_user is None:
+        if isinstance(data.get("multi_user"), dict):
+            say("多人共用已配置但开关关闭（multi_user.enabled = false，当前为单机形态）")
+        else:
+            say("多人共用未启用（单机形态）")
+        return 0
+    mu = config.multi_user
+    say(f"多人共用已启用（重启后生效的配置；用户目录本身热生效）")
+    say(f"  个人根目录：{mu.store_dir}" + ("" if mu.store_dir.is_dir() else "（当前不存在：0 个用户）"))
+    say(f"  管理员：{', '.join(mu.admins) if mu.admins else '（无）'}"
+        + ("" if mu.admins or (isinstance(data.get("multi_user"), dict)
+                               and isinstance(data["multi_user"].get("admins"), list))
+           else "（未配置 admins，默认 admin）"))
+    say(f"  访客写公共 source：{'允许' if mu.guest_writable else '禁止（默认）'}")
+    users, skipped = personal_sources_report(mu.store_dir, config.sources)
+    say(f"  已派生用户：{', '.join(src.name for src in users) or '（无）'}")
+    for item in skipped:
+        reason = {"invalid_name": "名字不合法", "name_conflict": "与现有 source 重名",
+                  "reserved": "编辑者保留字"}.get(item["reason"], item["reason"])
+        say(f"  已跳过目录：{item['name']}（{reason}）")
+    return 0
+
+
+def mu_admin_add(path: Path, args: argparse.Namespace) -> int:
+    data = copy.deepcopy(load(path))
+    mu = _require_multi_user(data)
+    name = args.name.strip()
+    admins = [a for a in mu.get("admins", []) if isinstance(a, str)]
+    if name in admins:
+        say(f"已是管理员：{name}")
+        return 0
+    admins.append(name)
+    mu["admins"] = admins
+    save(path, data)
+    say(f"已添加管理员 {name}（改配置，重启生效）")
+    return finish(path, args)
+
+
+def mu_admin_remove(path: Path, args: argparse.Namespace) -> int:
+    data = copy.deepcopy(load(path))
+    mu = _require_multi_user(data)
+    name = args.name.strip()
+    admins = [a for a in mu.get("admins", []) if isinstance(a, str)]
+    if name not in admins:
+        say(f"不在管理员名单中：{name}")
+        return 0
+    mu["admins"] = [a for a in admins if a != name]
+    save(path, data)
+    say(f"已移除管理员 {name}（改配置，重启生效）")
+    return finish(path, args)
+
+
+def mu_admin_list(path: Path, _args: argparse.Namespace) -> int:
+    data = load(path)
+    mu = data.get("multi_user")
+    admins = [a for a in mu.get("admins", []) if isinstance(a, str)] if isinstance(mu, dict) else []
+    say("管理员名单：" + (", ".join(admins) if admins else "（空）"))
+    return 0
+
+
+def user_list(path: Path, _args: argparse.Namespace) -> int:
+    data = read_config_data(path) if path.exists() else None
+    if not data:
+        raise CliError(f"配置文件不存在：{path}")
+    config = Config.from_data(data, config_file=path)
+    if config.multi_user is None:
+        raise CliError("未启用多人共用：先执行 python config.py multi-user set <个人根目录>")
+    users, skipped = personal_sources_report(config.multi_user.store_dir, config.sources)
+    say(f"个人根目录：{config.multi_user.store_dir}")
+    for src in users:
+        say(f"  {src.name}  →  {src.dir}")
+    for item in skipped:
+        reason = {"invalid_name": "名字不合法", "name_conflict": "与现有 source 重名",
+                  "reserved": "编辑者保留字"}.get(item["reason"], item["reason"])
+        say(f"  （已跳过）{item['name']}  # {reason}")
+    if not users and not skipped:
+        say("（个人根目录下没有一级子目录）")
+    return 0
+
+
+def user_add(path: Path, args: argparse.Namespace) -> int:
+    data = load(path)
+    mu_raw = _require_multi_user(data)
+    root_raw = mu_raw.get("store_dir")
+    if not isinstance(root_raw, str) or not root_raw.strip():
+        raise CliError("multi_user 缺少 store_dir：先执行 python config.py multi-user set <目录>")
+    # 用服务的校验口径：名字过 source 名白名单（会 strip），保留字与公共重名另查。
+    name = validate_source_name(args.name)
+    config = Config.from_data(data, config_file=path)
+    if _is_editor_reserved(name):
+        raise CliError(
+            f"名字 {name!r} 是编辑者保留字（不区分大小写），不能用作个人目录名")
+    if any(src.name.casefold() == name.casefold() for src in config.sources):
+        raise CliError(f"名字 {name!r} 与现有公共 source 重名，请换一个名字")
+    root = Path(os.path.abspath(Path(root_raw.strip()).expanduser()))
+    target = root / name
+    if target.exists():
+        raise CliError(f"目录已存在（该用户可能已开通）：{target}")
+    target.mkdir(parents=True)
+    say(f"已开通用户 {name}：{target}")
+    say("建目录即开通，热生效（无需重启）；MCP 端点：http://<服务器>:<端口>/mcp?user=" + name)
+    return 0
+
+
 # --- 运行中服务 --------------------------------------------------------------
 
 def service_address(path: Path) -> tuple[str, int]:
@@ -358,13 +548,36 @@ def service_address(path: Path) -> tuple[str, int]:
     return host, port if isinstance(port, int) else 7083
 
 
-def do_reindex(path: Path, _args: argparse.Namespace | None = None) -> int:
+def do_reindex(path: Path, args: argparse.Namespace | None = None) -> int:
     try:
         host, port = service_address(path)
     except ConfigError as exc:
         raise CliError(str(exc)) from exc
-    full = bool(getattr(_args, "full", False))
-    url = f"http://{'[' + host + ']' if ':' in host else host}:{port}/reindex" + ("?full=1" if full else "")
+    full = bool(getattr(args, "full", False))
+    # 多人共用下 /reindex 仅限管理员（服务端 403 拒绝）：CLI 自动携带管理员
+    # 身份——--user 显式指定，否则取 admins 名单首个；admins 未配置时用
+    # 默认管理员 admin；开关关闭（enabled=false）或单机形态不带 user。
+    user = ""
+    if path.exists():
+        mu = read_config_data(path).get("multi_user")
+        if isinstance(mu, dict) and mu.get("enabled", False):
+            explicit = (getattr(args, "user", None) or "").strip()
+            admins = [a for a in (mu or {}).get("admins", ["admin"])
+                      if isinstance(a, str) and a.strip()]
+            if explicit:
+                user = explicit
+            elif admins:
+                user = admins[0]
+            else:
+                raise CliError("多人共用下 reindex 仅限管理员：请先 multi-user admin add，"
+                               "或用 reindex --user <管理员名>")
+    params = []
+    if full:
+        params.append("full=1")
+    if user:
+        params.append("user=" + urllib.parse.quote(user, safe=""))
+    url = (f"http://{'[' + host + ']' if ':' in host else host}:{port}/reindex"
+           + ("?" + "&".join(params) if params else ""))
     request = urllib.request.Request(url, data=b"", method="POST")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -451,8 +664,58 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restart", action="store_true", help="改完后重启服务")
     p.set_defaults(func=config_edit)
 
+    mu = sub.add_parser("multi-user", help="多人共用形态：开关、个人根目录与管理员名单").add_subparsers(
+        dest="action", required=True)
+
+    p = mu.add_parser("set", help="启用多人共用：指定个人根目录（目录必须已存在；重启生效）")
+    p.add_argument("dir", help="个人根目录：其一级子目录每个对应一个用户")
+    p.add_argument("--guest-writable", dest="guest_writable", action="store_true", default=None,
+                   help="允许访客（无 ?user= 的匿名连接）写公共 source；默认禁止")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=multi_user_set)
+
+    p = mu.add_parser("enable", help="打开多人共用开关（multi_user.enabled = true；重启生效）")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=multi_user_enable)
+
+    p = mu.add_parser("disable", help="关闭多人共用开关（multi_user.enabled = false，"
+                                      "回到单机形态；其余配置保留，重启生效）")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=multi_user_disable)
+
+    p = mu.add_parser("unset", help="移除多人共用形态，回到单机")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=multi_user_unset)
+
+    p = mu.add_parser("show", help="展示 multi_user 配置与生效状态")
+    p.set_defaults(func=multi_user_show)
+
+    admin = mu.add_parser("admin", help="维护管理员名单（改配置，重启生效）").add_subparsers(
+        dest="admin_action", required=True)
+    p = admin.add_parser("add", help="添加管理员（全域读写；无需同名个人目录）")
+    p.add_argument("name", help="管理员名（任意字符串，但经 ?user= 传输：不得含控制字符、"
+                                "长度 ≤64、不得为保留字 agent/scan/guest——不区分大小写）")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=mu_admin_add)
+    p = admin.add_parser("remove", help="移除管理员")
+    p.add_argument("name")
+    p.add_argument("--restart", action="store_true", help="改完后重启服务")
+    p.set_defaults(func=mu_admin_remove)
+    p = admin.add_parser("list", help="列出管理员")
+    p.set_defaults(func=mu_admin_list)
+
+    usr = mu.add_parser("user", help="排障与开通：个人根目录下的用户目录").add_subparsers(
+        dest="user_action", required=True)
+    p = usr.add_parser("list", help="枚举个人根目录下的一级子目录与派生有效性")
+    p.set_defaults(func=user_list)
+    p = usr.add_parser("add", help="开通用户：校验名字合法后创建个人目录（建目录 = 开通，热生效）")
+    p.add_argument("name", help="用户名：中英文、数字、下划线、连字符；保留字 agent/scan/guest 不可用")
+    p.set_defaults(func=user_add)
+
     p = sub.add_parser("reindex", help="通知运行中的服务立即重建索引（默认增量，无需重启）")
     p.add_argument("--full", action="store_true", help="全量重建：忽略缓存，所有文件重读、重分词")
+    p.add_argument("--user", default=None,
+                   help="多人共用下的管理员名（admins 非空时可省略，默认取名单首个）；单机形态无需指定")
     p.set_defaults(func=do_reindex)
 
     p = sub.add_parser("restart", help="重启服务（调用 run.py --restart）")

@@ -19,11 +19,11 @@ from server import create_server
 
 from test_corpus import make_config
 
-# 常驻工具（不含受 allow_mcp_delete 开关控制的 delete / merge）。
+# 常驻工具（不含受 allow_mcp_delete 开关控制的 delete；merge 已移除，ADR-0032）。
 BASE_TOOLS = ["search", "get-document", "save", "rename", "replace",
               "list-sources", "recent"]
 
-ALL_TOOLS = [*BASE_TOOLS, "merge", "delete"]
+ALL_TOOLS = [*BASE_TOOLS, "delete"]
 TOOLS_WITH_PARAMS = [t for t in ALL_TOOLS if t != "list-sources"]
 
 
@@ -93,10 +93,11 @@ def test_all_five_tools_exposed(tools):
 
 
 def test_delete_tools_hidden_until_enabled(tmp_path: Path):
-    """allow_mcp_delete 默认关闭：delete 与 merge 必须整体不存在于 tools/list。
+    """allow_mcp_delete 默认关闭：delete 必须整体不存在于 tools/list。
 
     隐藏比"列出但拒绝"更可靠——LLM 看不到就不会调用，也不会试图绕道
     （比如用整篇替换把内容替换成空）。开启开关的唯一入口是人工改配置。
+    merge 已移除（ADR-0032），断路器只管 delete。
     """
     root = tmp_path / "memory" / "技术"
     root.mkdir(parents=True)
@@ -209,7 +210,7 @@ def test_recent_documents_its_limit_and_fields(tools):
     tool = tools["recent"]
     assert "1-20" in tool.input_schema["properties"]["limit"]["description"]
     assert "默认 10" in tool.input_schema["properties"]["limit"]["description"]
-    for word in ("edited_by", "agent", "scan"):
+    for word in ("editor", "agent", "scan"):
         assert word in tool.description
 
 

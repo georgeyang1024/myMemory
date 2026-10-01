@@ -1,11 +1,13 @@
 # myMemory — 架构设计
 
-> 人与 AI 共同记忆的 MCP 检索与写入服务（多 source），版本 **0.3.0**
+> 人与 AI 共同记忆的 MCP 检索与写入服务（多 source），版本 **0.5.0**
 > 状态：已实施并验证通过（2026-09-02 首版检索服务；2026-09-17 改造为可写的个人记忆库；
 > 2026-09-24 0.1.0：多 source、writable 字段、config.json + config.py、最近编辑列表、
 > 索引缓存与增量更新、挂载盘掉线处理、工具短名、单平台运行。
 > 2026-09-27 0.2.0：写入面扩展 rename / replace / merge / delete + 删除断路器 allow_mcp_delete。
 > 2026-09-28 0.3.0：刷新只填全文 LRU 空位；冷启动指纹不符时抢救掉盘 source、沿用 agent 标记；指纹去掉代码版本号。
+> 2026-10-01 0.5.0：多人共用部署（`multi_user` 配置、`?user=` 路由、管理员全域、
+> `editor` 编辑者登记、merge 移除），见 [REQUIREMENTS §16](REQUIREMENTS.md)。
 > 需求见 [REQUIREMENTS](REQUIREMENTS.md)）
 
 > **本文档描述现状。** 本项目的由来、以及为什么 ADR-0002/0004/0011/0012 里
@@ -154,12 +156,12 @@ source 名、分类名与文件名都参与分词（[ADR-0012](adr/0012-path-and
 
 | 模块 | 职责 | 不做什么 |
 |---|---|---|
-| `src/config.py` | 读 config.json，校验并构造不可变配置；source 规则（含 `writable`）；字符白名单；`domain_terms` 词表。仅标准库，根目录 CLI config.py 与 run.py 复用 | 不检查目录是否存在 |
+| `src/config.py` | 读 config.json，校验并构造不可变配置；source 规则（含 `writable`）；字符白名单；`domain_terms` 词表；多人共用子项 `multi_user`（`parse_multi_user`）与个人 source 派生（`personal_sources` / `effective_sources` / `find_user` / `is_admin`）。仅标准库，根目录 CLI config.py 与 run.py 复用 | 不检查目录是否存在 |
 | `storage.py` | 存储接口与 `LocalStorage`：可用性探测（Windows 探盘根；Linux 带 3 秒超时的 `ls`，超时不等遗留子进程、其退出前不再起新探测）、列文件、读、写、移动（`move`）、删除（`remove`）；只读与目录不存在的最后一道闸 | 不认识索引；`iter_files`/`read_text` 无超时，hard mount 途中掉盘仍可能阻塞扫描 |
 | `corpus.py` | DocMeta / Chunk 数据形态、固定窗口切块 | 不碰磁盘，不认识 BM25 |
 | `index.py` | jieba 分词、按文件增量刷新、掉盘保留、BM25、索引缓存读写、查询打分、轮询、快照原子替换 | 不认识 HTTP，不做参数校验 |
-| `writer.py` | **唯一写磁盘的边界**：source/分类/文件名校验、只读与可用性拒写、落盘；`rename_memory` / `replace_memory` / `merge_memory` / `delete_memory` 同边界，删除类受 `allow_mcp_delete` 闸 | 不认识索引，不认识 HTTP |
-| `server.py` | MCP 工具、REST 端点、有效 `writable` 计算、入参校验、响应裁剪 | 不做检索逻辑，不做落盘逻辑 |
+| `writer.py` | **唯一写磁盘的边界**：source/分类/文件名校验、只读与可用性拒写、落盘；`rename_memory` / `replace_memory` / `delete_memory` 同边界，删除受 `allow_mcp_delete` 闸（merge 已移除，ADR-0032） | 不认识索引，不认识 HTTP |
+| `server.py` | MCP 工具、REST 端点、有效 `writable` 计算、入参校验、响应裁剪；多人共用：`UserScopeMiddleware`（`?user=` 校验 + 内部头注入）、`scoped_config` 会话限域、范围名集过滤 | 不做检索逻辑，不做落盘逻辑 |
 | `src/main.py` | 组装：读配置 → 探测可用性并警告 → 加载缓存或全量构建 → 启动轮询 → 起传输层 | 不含业务逻辑 |
 | `run.py` | 启动入口：`.venv`、依赖、前台/后台启停；向子进程钉死绝对 `MEMORY_CONFIG` | 不管配置内容 |
 | 仓库根 `config.py`（CLI） | 人工管理 source、刷新周期、reindex、restart | 不起服务 |
@@ -170,7 +172,7 @@ source 名、分类名与文件名都参与分词（[ADR-0012](adr/0012-path-and
 
 ```
 启动
- └─► Config.load()                 MEMORY_CONFIG 或 ~/.myMemory/config.json；缺失则交互式建档（ADR-0025），无法交互则报错
+ └─► Config.load()                 MEMORY_CONFIG 或 ~/.myMemory/config.json；缺失则交互式建档（先问个人使用/团队使用，ADR-0025），无法交互则报错
      └─► 逐个 probe() source     不可用只警告，不失败
          └─► load_cache()          格式 + 配置指纹校验
               ├─ 命中 → 直接构成快照（含序列化的 BM25），立即监听；verifying = true
@@ -260,37 +262,35 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 返回 `replaced_count`。命中 0 处、`new_string` 为空、old==new 一律拒绝且不动文件。
 成功响应带替换后全文长度 `char_count`。
 
-### 6.6 `merge(source, from_path, to_path)` —— `allow_mcp_delete` 控制
-
-把**已存在**的 `from_path` 并入**已存在**的 `to_path`（目标不存在即拒绝，新建用 save），
-然后**删除源文件**。并入段以 `## 源文件相对路径` 起头、前有 `---` 分隔线（来源可追溯）。
-先写目标后删源：删除失败不回滚，响应里的 `source_removed: false` 如实标出。
-
-### 6.7 `delete(source, path)` —— `allow_mcp_delete` 控制
+### 6.6 `delete(source, path)` —— `allow_mcp_delete` 控制
 
 真删（`unlink`，无备份、不可恢复）。断路器 `allow_mcp_delete` 默认关闭：
-关闭时 **6.6 / 6.7 两个工具连注册都不注册**，对 AI 完全不可见；writer 层
+关闭时该工具**连注册都不注册**，对 AI 完全不可见；writer 层
 （`_require_delete_enabled`）再用同一开关兜一道运行时闸。
+`merge` 工具已移除（连实现，[ADR-0032](adr/0032-remove-merge-tool.md)）：
+合并工作流走"search/get-document 读两篇 → save 合并稿 → delete 源"或人工编辑。
 
-### 6.8 `list-sources()`
+### 6.7 `list-sources()`
 
 `{"sources": [{"name", "writable", "available", "unavailable_reason", "doc_count", "description"}]}`，
 **不含目录路径**。MCP instructions 保持静态，只写规则，不列具体名称。
+多人共用形态下返回会话范围全集（公共 + 本人个人 / 管理员全域）。
 
-### 6.9 `recent(limit=10, source="")`
+### 6.8 `recent(limit=10, source="")`
 
 默认 10、最多 20 条，按文件 mtime 倒序，每文件一条：
-`{"source", "path", "writable", "updated_at", "size", "edited_by": "agent" | "scan"}`。
-`edited_by` 由条目的 `agent_mtime` 判定（[ADR-0018](adr/0018-edited-by-via-status-file.md)）。
+`{"source", "path", "writable", "updated_at", "size", "editor": "agent" | "scan" | <用户名> | "guest"}`。
+`editor` 由条目的 `agent_mtime` / `agent_editor` 判定
+（[ADR-0018](adr/0018-edited-by-via-status-file.md)、[ADR-0031](adr/0031-editor-attribution.md)）。
 
-### 6.10 REST 端点
+### 6.9 REST 端点
 
 | 端点 | 用途 |
 |---|---|
-| `GET /health` | 版本、索引规模、`rebuilding`、`verifying`、当前配置、`config_file`、`sources`（含 `dir`；MCP `list-sources` 不含） |
-| `GET /search?q=…&limit=…&source=…` | 与 `search` 完全一致的 JSON |
-| `GET /recent?limit=…&source=…` | 与 `recent` 完全一致的 JSON |
-| `POST /reindex[?full=1]` | 刷新索引（合并并发请求），返回 `{"index_refresh", "mode"}` |
+| `GET /health` | 版本、索引规模、`rebuilding`、`verifying`、当前配置、`config_file`、`sources`（含 `dir`；MCP `list-sources` 不含）；多人共用时另带 `multi_user` 块（默认仅 `store_dir`/`guest_writable`，`?user=<管理员名>` 另给 `admins` 与用户清单） |
+| `GET /search?q=…&limit=…&source=…&user=…` | 与 `search` 完全一致的 JSON，`?user=` 同规则限域 |
+| `GET /recent?limit=…&source=…&user=…` | 与 `recent` 完全一致的 JSON，`?user=` 同规则限域 |
+| `POST /reindex[?full=1]` | 刷新索引（合并并发请求），返回 `{"index_refresh", "mode"}`；多人共用下仅管理员（`?user=<管理员名>`，其余 403），单机不限 |
 
 ---
 
@@ -298,8 +298,10 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 
 全部配置在 `config.json`：默认位于 **`~/.myMemory/`**，唯一环境变量 `MEMORY_CONFIG` 覆盖其位置；
 `index.cache` 与 `logs/`（日志、PID）都放在配置文件所在目录，代码目录不落任何运行数据；
-配置不存在时在终端**交互式建档**（ADR-0025）：询问记忆目录，生成默认值 + source `memory`
-（描述"默认记忆源"）；无法交互（stdio、后台）时报错"未指定记忆存储"。
+配置不存在时在终端**交互式建档**（ADR-0025）：先问使用形态——个人使用（询问
+记忆目录，生成默认值 + source `memory`，描述"默认记忆源"）或团队使用（询问
+团队存储目录与管理员账号默认 admin，写 `multi_user`，不建公共 source）；
+无法交互（stdio、后台）时报错"未指定记忆存储"。
 修改一律**重启生效**。人可直接编辑，或用 `config.py`（source 增删改含 `--readonly` / `--writable`、
 `config set poll_interval` / `max_cached_docs` / `allow_mcp_delete`）。字段与默认值见 README「配置」一节。
 
@@ -334,9 +336,25 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 - **分类名与文件名是标识符**：白名单不含 `/` 与 `\`，`..`、首尾 `.`、Windows 保留名另行禁止
 - 同路径整篇覆盖，不可撤销、无备份；空正文一律拒绝
 - **删除是断路器保护的能力**：`allow_mcp_delete`（config.json，默认 `false`，重启生效）。
-  关闭时 `delete` 与 `merge`（删源）不注册、写层同开关再拦；开启后真删，无备份
+  关闭时 `delete` 不注册、写层同开关再拦；开启后真删，无备份。
+  merge 已移除（[ADR-0032](adr/0032-remove-merge-tool.md)），断路器只管 `delete`
 
 详见 [ADR-0014](adr/0014-write-tool-boundary.md) 与 [ADR-0022](adr/0022-writable-field.md)。
+
+### 8.3.1 多人共用的限域与身份（ADR-0028 ~ 0031）
+
+多人共用形态（`multi_user` 配置且 `enabled: true`——开关默认 false，块可预配不启用）：
+
+- **限域两层**：ASGI 中间件按 `?user=` 校验（合法集 = admins ∪ 个人目录名，未命中
+  HTTP 400）并注入内部头 `x-mymemory-user`（percent-encode 传输——ASGI 头按
+  latin-1 解码，中文用户名必须 ASCII 安全；**每请求无条件删除客户端自带的同名
+  头**——身份只来自 `?user=`）；工具层据此构造 scoped config（管 `source=`
+  显式参数与写入），加上**范围名集过滤**（管默认跨 source 的 search / recent /
+  get-document / 相近建议）——否则全局快照会泄漏他人内容。
+- **访客**（无 user 参数）：仅公共 source，默认只读（`multi_user.guest_writable`
+  默认 false，ADR-0030 修订）。stdio 忽略整个 `multi_user`，行为与单机一致。
+- **编辑者登记**：recent 的 `editor` 字段登记写入主体（ADR-0031）；保留字
+  agent/scan/guest 不区分大小写地禁用于个人目录名与管理员名。
 
 ### 8.4 缓存文件
 
@@ -402,7 +420,7 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | [0003](adr/0003-evidence-not-answers.md) | 服务语义 | 纯检索返回证据 |
 | [0004](adr/0004-md-txt-only.md) | 文件类型 | 仅 .md/.txt |
 | [0005](adr/0005-fixed-window-chunking.md) | 切块策略 | 统一固定窗口 800/120 |
-| [0006](adr/0006-two-tool-surface.md) | 工具面 | 最小工具面（现为 9 个：常驻 7 + `allow_mcp_delete` 控制 2），工具名不带前缀 |
+| [0006](adr/0006-two-tool-surface.md) | 工具面 | 最小工具面（现为 8 个：常驻 7 + `allow_mcp_delete` 控制 1；merge 已移除，ADR-0032），工具名不带前缀 |
 | [0007](adr/0007-in-memory-index-with-polling.md) | 索引生命周期 | 全内存快照 + 轮询 + 原子替换（持久化部分被 0019 取代） |
 | [0008](adr/0008-machine-agnostic-delivery.md) | 交付边界 | 只交付源码，不含部署 |
 | [0009](adr/0009-official-sdk-streamable-http.md) | 实现栈 | 官方 SDK + Streamable HTTP + REST 端点 |
@@ -423,5 +441,10 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | [0024](adr/0024-max-cached-docs.md) | 内存上限 | 常驻内存的全文最多 max_cached_docs 篇（LRU） |
 | [0026](adr/0026-offline-content-natural-lru-and-cold-start-rescue.md) | 掉盘与缓存 | 刷新只填 LRU 空位；冷启动指纹不符时抢救掉盘 source；指纹去掉版本号 |
 | [0027](adr/0027-search-scoring-adjustments.md) | 检索打分 | `scoring`：时间加分、路径命中加分、分词前去除 wikilink；source 按字段覆盖 |
+| [0028](adr/0028-multi-user-shared-deployment.md) | 多人共用形态 | 公共 source 沿用 + 个人根目录 + `?user=` 路由；路由层硬、身份层软（知道用户名即可冒充） |
+| [0029](adr/0029-single-instance-scoping-and-dynamic-personal-sources.md) | 单实例限域 | 每请求 scoped config + 范围名集过滤；个人 source 当场枚举热发现（无轮询指纹） |
+| [0030](adr/0030-multi-user-config-and-admin-full-scope.md) | 管理员 | `multi_user` 配置子项（`enabled` 开关默认 false、store_dir 必填、admins 可选默认 `["admin"]`、guest_writable 默认 false）；管理员全域单会话 |
+| [0031](adr/0031-editor-attribution.md) | 编辑者登记 | `edited_by` 更名 `editor` 并登记路由身份（用户名/管理员名/guest）；CACHE_FORMAT 3→4 |
+| [0032](adr/0032-remove-merge-tool.md) | merge 移除 | 工具+实现连删；allow_mcp_delete 语义收窄为只管 delete |
 
 术语定义见 [GLOSSARY.md](GLOSSARY.md)。

@@ -3,6 +3,14 @@
 **状态**：已采纳并实施 · 2026-09-26
 **取代**：[REQUIREMENTS §4.1](../REQUIREMENTS.md) 的"首次启动不存在时自动生成：只含读写 source `memory` → `mcp/../memory`"。
 
+**修订**：2026-10-01——交互建档前先问使用形态：**个人使用**（默认，逐字问记忆
+目录，行为同前）或**团队使用**（多人共用，ADR-0028/0030）：逐字问团队存储目录
+（子文件夹 = 团队成员，回车默认 `~/.myMemory/users`）与管理员账号（逗号分隔
+多个，回车默认 admin），写出 `multi_user`（`enabled: true`）。团队形态**不建
+公共 source**（需要共享记忆再 `config.py source add`），配置校验相应放宽：
+`multi_user` 启用时允许 `sources` 缺省/为空，语料 = 成员个人 source。
+非交互建档（`--init` 管道下）按个人使用 + 默认目录兜底，与原行为一致。
+
 ## 背景
 
 此前的默认配置按代码位置反推记忆目录：`config.py` 位于 `mcp/src/my_memory/`，

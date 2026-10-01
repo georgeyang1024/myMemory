@@ -158,6 +158,23 @@ def test_empty_sources_rejected(dirs):
         Config.load(write(dirs / "config.json", {"sources": []}))
 
 
+def test_team_mode_allows_empty_sources(tmp_path: Path):
+    """multi_user 启用时允许没有公共 source：语料 = 存储目录派生的个人 source。"""
+    path = write(tmp_path / "config.json", {
+        "multi_user": {"enabled": True, "store_dir": str(tmp_path / "users")}})
+    config = Config.load(path, create_default=False)
+    assert config.sources == ()
+    assert config.multi_user is not None
+
+
+def test_disabled_multi_user_still_requires_sources(tmp_path: Path):
+    """开关关闭（单机形态）时没有公共 source 依旧不合法。"""
+    path = write(tmp_path / "config.json", {
+        "multi_user": {"enabled": False, "store_dir": str(tmp_path / "users")}})
+    with pytest.raises(ConfigError, match="非空数组"):
+        Config.load(path, create_default=False)
+
+
 # --- 其余字段 ---------------------------------------------------------------
 
 @pytest.mark.parametrize("field,value", [
@@ -238,7 +255,7 @@ def test_scoring_defaults_when_omitted(dirs):
     from config import Scoring
     config = Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")]}))
     expected = Scoring(recency_window_days=30, recency_bonus=10, path_match_bonus=5,
-                       strip_wikilinks=True)
+                       strip_wikilinks=True, historical_penalty=0, historical_keywords=())
     assert config.scoring == expected
     assert config.sources[0].scoring == expected
 
@@ -267,6 +284,56 @@ def test_float_bonus_is_accepted(dirs):
     config = Config.load(write(dirs / "config.json", {
         "scoring": {"path_match_bonus": 2.5}, "sources": [ws("a", dirs / "a")]}))
     assert config.scoring.path_match_bonus == 2.5
+
+
+# --- historical_penalty / historical_keywords（ADR-0033） ----------------------
+
+def test_historical_scoring_defaults_off(dirs):
+    config = Config.load(write(dirs / "config.json", {"sources": [ws("a", dirs / "a")]}))
+    assert config.scoring.historical_penalty == 0
+    assert config.scoring.historical_keywords == (), "默认关闭：不降任何分"
+
+
+def test_historical_keywords_are_normalized(dirs):
+    """strip、转小写、去重保序——匹配不区分大小写在配置层完成一次。"""
+    config = Config.load(write(dirs / "config.json", {
+        "scoring": {"historical_keywords": [" Meeting ", "已废弃", "meeting", "DEPRECATED"]},
+        "sources": [ws("a", dirs / "a")]}))
+    assert config.scoring.historical_keywords == ("meeting", "已废弃", "deprecated")
+
+
+def test_source_overrides_historical_scoring_per_field(dirs):
+    config = Config.load(write(dirs / "config.json", {
+        "scoring": {"historical_penalty": 3, "historical_keywords": ["meeting"]},
+        "sources": [ws("a", dirs / "a", scoring={"historical_penalty": 5}),
+                    ws("b", dirs / "b", scoring={"historical_keywords": []}),
+                    ws("c", dirs / "c")],
+    }))
+    a, b, c = config.sources
+    assert (a.scoring.historical_penalty, a.scoring.historical_keywords) == (5, ("meeting",))
+    assert (b.scoring.historical_penalty, b.scoring.historical_keywords) == (3, ())
+    assert (c.scoring.historical_penalty, c.scoring.historical_keywords) == (3, ("meeting",))
+
+
+@pytest.mark.parametrize("scoring,field", [
+    ({"historical_penalty": -1}, "historical_penalty"),
+    ({"historical_penalty": True}, "historical_penalty"),
+    ({"historical_penalty": "3"}, "historical_penalty"),
+    ({"historical_keywords": "meeting"}, "historical_keywords"),
+    ({"historical_keywords": ["meeting", ""]}, "historical_keywords"),
+    ({"historical_keywords": ["meeting", 3]}, "historical_keywords"),
+])
+def test_invalid_historical_scoring_is_rejected_naming_the_field(dirs, scoring, field):
+    with pytest.raises(ConfigError, match=field):
+        Config.load(write(dirs / "config.json", {
+            "scoring": scoring, "sources": [ws("a", dirs / "a")]}))
+
+
+def test_too_many_historical_keywords_is_rejected(dirs):
+    with pytest.raises(ConfigError, match="historical_keywords"):
+        Config.load(write(dirs / "config.json", {
+            "scoring": {"historical_keywords": [f"kw{i}" for i in range(101)]},
+            "sources": [ws("a", dirs / "a")]}))
 
 
 @pytest.mark.parametrize("where", ["global", "source"])
@@ -306,7 +373,8 @@ def test_scoring_must_be_an_object(dirs, where):
 def test_bootstrap_config_writes_scoring_defaults():
     data = bootstrap_config_data()
     assert data["scoring"] == {"recency_window_days": 30, "recency_bonus": 10,
-                               "path_match_bonus": 5, "strip_wikilinks": True}
+                               "path_match_bonus": 5, "strip_wikilinks": True,
+                               "historical_penalty": 0, "historical_keywords": []}
 
 
 def test_describe_reports_effective_scoring(dirs):
@@ -317,4 +385,5 @@ def test_describe_reports_effective_scoring(dirs):
     scoring = config.describe()["scoring"]
     assert scoring["default"]["recency_bonus"] == 8
     assert scoring["sources"] == {"b": {"recency_window_days": 30, "recency_bonus": 0,
-                                        "path_match_bonus": 5, "strip_wikilinks": True}}
+                                        "path_match_bonus": 5, "strip_wikilinks": True,
+                                        "historical_penalty": 0, "historical_keywords": ()}}

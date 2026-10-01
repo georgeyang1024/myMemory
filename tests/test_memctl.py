@@ -300,6 +300,85 @@ def test_reindex_posts_to_running_service(env, monkeypatch, capsys):
     assert "全量" in capsys.readouterr().out
 
 
+def test_reindex_multi_user_carries_admin(env, monkeypatch, capsys):
+    """多人共用下 reindex 需要管理员身份：CLI 默认带 admins 首个，或 --user 显式指定。"""
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"index_refresh": "started"}'
+
+    def fake_urlopen(request, timeout):
+        seen["url"] = request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(config_cli.urllib.request, "urlopen", fake_urlopen)
+    root, config = env
+    cfg = data(config)
+    cfg["multi_user"] = {"enabled": True, "store_dir": str(root / "users"),
+                         "admins": ["李四", "王五"]}
+    config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    assert config_cli.main(["reindex"]) == 0
+    assert seen["url"].endswith("/reindex?user=%E6%9D%8E%E5%9B%9B")  # 默认取 admins 首个
+
+    assert config_cli.main(["reindex", "--user", "王五"]) == 0
+    assert seen["url"].endswith("/reindex?user=%E7%8E%8B%E4%BA%94")
+
+    assert config_cli.main(["reindex", "--full"]) == 0
+    assert seen["url"].endswith("/reindex?full=1&user=%E6%9D%8E%E5%9B%9B")
+
+
+def test_reindex_multi_user_defaults_to_admin(env, capsys, monkeypatch):
+    """多人共用下未配置 admins：默认管理员 admin 兜底；开关关闭则回到单机、不带 user。"""
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"index_refresh": "started"}'
+
+    def fake_urlopen(request, timeout):
+        seen["url"] = request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(config_cli.urllib.request, "urlopen", fake_urlopen)
+    root, config = env
+    cfg = data(config)
+    cfg["multi_user"] = {"enabled": True, "store_dir": str(root / "users")}
+    config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    assert config_cli.main(["reindex"]) == 0
+    assert seen["url"].endswith("/reindex?user=admin")  # 未配置 admins，默认 admin
+
+    cfg["multi_user"] = {"enabled": False, "store_dir": str(root / "users")}
+    config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    seen.clear()
+    assert config_cli.main(["reindex"]) == 0
+    assert "?" not in seen["url"].split("/reindex")[-1] and seen["url"].endswith("/reindex")
+
+
+def test_reindex_multi_user_empty_admins_is_error(env, capsys):
+    """显式给出空 admins（无管理员，未配置默认 admin 兜底不适用）：reindex 必须显式 --user。"""
+    root, config = env
+    cfg = data(config)
+    cfg["multi_user"] = {"enabled": True, "store_dir": str(root / "users"), "admins": []}
+    config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    assert config_cli.main(["reindex"]) == 2
+    assert "管理员" in capsys.readouterr().err
+
+
 def test_set_max_cached_docs(env, capsys):
     _, config = env
     assert config_cli.main(["config", "set", "max_cached_docs", "500"]) == 0
@@ -415,3 +494,61 @@ def test_list_shows_source_scoring_overrides(env, capsys):
     capsys.readouterr()
     assert config_cli.main(["source", "list"]) == 0
     assert "recency_bonus=0" in capsys.readouterr().out
+
+
+# --- historical_penalty / historical_keywords（ADR-0033） ----------------------
+
+def test_edit_global_historical_scoring(env):
+    _, config = env
+    assert config_cli.main(["config", "edit", "--scoring", "historical_penalty=3"]) == 0
+    assert data(config)["scoring"] == {"historical_penalty": 3}
+    assert config_cli.main(["config", "edit", "--scoring",
+                            "historical_keywords=meeting,已废弃,已过期"]) == 0
+    assert data(config)["scoring"] == {
+        "historical_penalty": 3, "historical_keywords": ["meeting", "已废弃", "已过期"]}
+
+
+def test_historical_keywords_comma_separated_drops_empty_items(env):
+    _, config = env
+    assert config_cli.main(["config", "edit", "--scoring",
+                            "historical_keywords= meeting , 已废弃 ,,deprecated,"]) == 0
+    assert data(config)["scoring"] == {
+        "historical_keywords": ["meeting", "已废弃", "deprecated"]}
+    assert config_cli.main(["config", "edit", "--scoring", "historical_keywords="]) == 0
+    assert data(config)["scoring"] == {"historical_keywords": []}
+
+
+def test_edit_source_historical_scoring_and_reset(env, capsys):
+    _, config = env
+    assert config_cli.main(["source", "edit", "memory", "--scoring", "historical_penalty=3",
+                            "--scoring", "historical_keywords=meeting"]) == 0
+    assert data(config)["sources"][0]["scoring"] == {
+        "historical_penalty": 3, "historical_keywords": ["meeting"]}
+    assert config_cli.main(["source", "edit", "memory",
+                            "--reset-scoring", "historical_keywords"]) == 0
+    assert data(config)["sources"][0]["scoring"] == {"historical_penalty": 3}
+    assert config_cli.main(["source", "edit", "memory", "--reset-scoring", "all"]) == 0
+    assert "scoring" not in data(config)["sources"][0]
+
+
+@pytest.mark.parametrize("argv", [
+    ["config", "edit", "--scoring", "historical_penalty=-3"],
+    ["config", "edit", "--scoring", "historical_penalty=old"],
+    ["source", "edit", "memory", "--reset-scoring", "historical_keywords"],  # 没有这项覆盖
+])
+def test_invalid_historical_scoring_leaves_config_untouched(env, argv, capsys):
+    _, config = env
+    before = config.read_bytes()
+    assert config_cli.main(argv) == 2
+    assert config.read_bytes() == before
+    assert "错误" in capsys.readouterr().err
+
+
+def test_list_shows_historical_keyword_override(env, capsys):
+    config_cli.main(["source", "edit", "memory", "--scoring", "historical_penalty=3",
+                     "--scoring", "historical_keywords=meeting,已废弃"])
+    capsys.readouterr()
+    assert config_cli.main(["source", "list"]) == 0
+    output = capsys.readouterr().out
+    assert "historical_penalty=3" in output
+    assert "historical_keywords=meeting,已废弃" in output

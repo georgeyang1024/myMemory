@@ -10,6 +10,44 @@
 
 ---
 
+## [0.5.0] · 2026-10-01
+
+多人共用部署，详见 [SPEC-MULTI-USER](docs/SPEC-MULTI-USER.md)、
+[ADR-0028](docs/adr/0028-multi-user-shared-deployment.md) ~
+[ADR-0032](docs/adr/0032-remove-merge-tool.md) 与 [REQUIREMENTS §16](docs/REQUIREMENTS.md)。
+
+### 新增
+
+- **首次建档选使用形态**：个人使用（行为同前）或团队使用（问团队存储目录与管理员
+  账号，写 `multi_user`，完成提示含 MCP 接入方式）
+- **团队形态允许没有公共 source**：`multi_user.enabled: true` 时 `sources` 可缺省/为空
+- **多人共用**：`multi_user` 配置（`enabled` 默认 false、`store_dir` 个人根目录、
+  `admins` 默认 `["admin"]`、`guest_writable` 默认 false）；公共 source 沿用 `sources`
+- **`?user=<名字>` 路由**：会话范围 = 公共 + 本人个人 source；建目录 = 开通（热生效）；
+  未开通 400 拒绝；访客（无参数）仅公共且默认只读
+- **管理员全域读写**；限域两层——默认跨 source 的 search / recent / get-document
+  也过滤会话范围，不泄漏其他用户的内容与路径
+- **CLI**：`multi-user set/unset/enable/disable/show/user list/user add`、
+  `multi-user admin add/remove/list`
+- `/health` 揭示 `multi_user` 块，按身份分层（默认仅 `store_dir`、`guest_writable`）
+- **检索打分：历史关键字降分**（`scoring.historical_penalty` / `historical_keywords`，
+  默认关闭）：路径含关键字的旧文档降分，只降不排除；详见
+  [ADR-0033](docs/adr/0033-search-historical-keyword-penalty.md)
+
+### 变更（含破坏性）
+
+- **`POST /reindex` 多人共用下仅管理员**（其余 403）；`config.py reindex` 自动携带管理员身份
+- **`edited_by` 更名 `editor`**（recent 输出）：多人形态 MCP 写入登记路由身份，非 MCP 改动仍 scan
+- **`CACHE_FORMAT` 3→4（不兼容旧缓存）**：升级后首次启动全量重建一次
+- 缓存启动与抢救路径改用 effective sources，个人 source 条目不再被过滤丢弃
+
+### 移除
+
+- **`merge` MCP 工具**（低频无用且真删源，[ADR-0032](docs/adr/0032-remove-merge-tool.md)）；
+  合并改走"读两篇 → `save` 合并稿 → `delete` 源"。`allow_mcp_delete` 语义收窄为只管 `delete`
+
+---
+
 ## [0.4.0] · 2026-09-29
 
 检索打分调整，详见 [ADR-0027](docs/adr/0027-search-scoring-adjustments.md) 与
