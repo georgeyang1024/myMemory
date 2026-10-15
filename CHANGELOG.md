@@ -10,6 +10,28 @@
 
 ---
 
+## [0.6.0] · 2026-10-15
+
+详见 [ADR-0034](docs/adr/0034-raw-text-tool-output.md)。
+
+### 修复
+
+- 照抄 `search` / `get-document` 的原文做 `replace` 常命中 0 处：原文放在 JSON 里被转义
+  （SDK 还会再包一层 `{"result": ...}`），复制时带进多余反斜杠。现在原文原样输出
+
+### 变更（破坏性：仅这两个工具的 MCP 输出）
+
+- `get-document`：首行 JSON 元数据，其后是正文原文
+- `search`：首行 JSON 总体信息（含 `boundary`），每条命中以边界行分隔，元数据一行 JSON + 片段原文
+- 两个工具的描述精简，减少 token
+- REST 与其余工具不变
+
+### 文档
+
+- README 补输出格式示例；删除 `merge` 残留；`edited_by` 更正为 `editor`
+
+---
+
 ## [0.5.0] · 2026-10-01
 
 多人共用部署，详见 [SPEC-MULTI-USER](docs/SPEC-MULTI-USER.md)、

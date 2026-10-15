@@ -116,23 +116,45 @@ python3 run.py --logs         # 跟踪日志（Ctrl-C 只退出跟踪，不影�
 
 ## MCP 工具
 
-常驻 7 个 + 删除类 2 个（默认隐藏），客户端看到的全名形如 `mcp__myMemory__save`
+常驻 7 个 + `delete` 1 个（默认隐藏），客户端看到的全名形如 `mcp__myMemory__save`
 （服务名+工具名由客户端拼接）。
 
 | 工具 | 一句话说明 |
 |---|---|
-| `search(query, limit=10, source="")` | BM25 全文检索，默认跨全部 source；返回带 `source`/`path`/`writable` 的原文片段，source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词 |
-| `get-document(source, path, offset=0, limit=40000)` | 读取原文，字符级分页；响应带 `writable` 与 `stale`（掉盘时内容来自缓存） |
+| `search(query, limit=10, source="")` | BM25 全文检索，默认跨全部 source，返回原文片段²；source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词 |
+| `get-document(source, path, offset=0, limit=40000)` | 读取原文²，字符级分页；元数据带 `writable` 与 `stale`（掉盘时内容来自缓存） |
 | `save(source, filename, content, category="")` | 写一篇记忆到 `<source>/<category>/<filename>.md`；**已存在即整篇覆盖**（不可撤销、无备份），空正文拒绝 |
 | `rename(source, old_path, new_path)` | 同 source 内改名/移动一级分类；旧文件必须存在，**目标存在即拒绝**，不覆盖 |
 | `replace(source, path, old_string, new_string)` | 全文**完全字面**替换 old→new（无正则/大小写折叠），命中几处换几处并返回 `replaced_count`；0 命中或空 new_string 拒绝 |
 | `list-sources()` | 列出全部 source（`writable`/`available`/`doc_count`…），**不返回目录路径**；写入目标从这里选 |
-| `recent(limit=10, source="")` | 最近更新，每文件一条；`edited_by` 区分 `agent`（工具写入）/ `scan`（人改的或绕过服务的改动） |
-| `merge(source, from_path, to_path)`¹ | 把一篇**已存在**的记忆并入另一篇（并入段带 `## 来源` 标题与 `---` 分隔线），然后**删除源文件**；先写后删，删除失败以 `source_removed: false` 标出 |
+| `recent(limit=10, source="")` | 最近更新，每文件一条；`editor` 区分 `agent`（工具写入）/ `scan`（人改的或绕过服务的改动），多人共用时记写入者身份 |
 | `delete(source, path)`¹ | **真删**（无备份、不可恢复），`path` 与 `search` 返回同形 |
 
-> ¹ `merge` / `delete` 都真删文件，受配置开关 `allow_mcp_delete`（默认 `false`，重启生效）
+> ¹ `delete` 真删文件，受配置开关 `allow_mcp_delete`（默认 `false`，重启生效）
 > 控制：关闭时连工具都不会出现在 tools/list 里，LLM 看不到就不会调；开启需人工改配置。
+> `merge` 已在 0.5.0 移除（[ADR-0032](docs/adr/0032-remove-merge-tool.md)）。
+>
+> ² 原文不转义、可直接复制作 `replace` 的 `old_string`，格式见下（[ADR-0034](docs/adr/0034-raw-text-tool-output.md)）。
+
+**`search` / `get-document` 的输出格式**：单个文本块，元数据一行 JSON，原文原样跟在后面。
+
+```text
+get-document：
+{"source": "memory", "path": "技术/笔记.md", "total_chars": 1200, "has_more": false, ...}
+正文原文……（第一个换行之后全部是正文）
+
+search：
+{"query": "…", "total_matched": 12, "returned": 2, "boundary": "========== myMemory-7f3a9c2e41d0b8a ==========", ...}
+========== myMemory-7f3a9c2e41d0b8a ==========
+{"n": 1, "source": "memory", "path": "技术/笔记.md", "char_start": 0, "char_end": 800, ...}
+片段原文……
+========== myMemory-7f3a9c2e41d0b8a ==========
+{"n": 2, ...}
+片段原文……
+========== myMemory-7f3a9c2e41d0b8a ==========
+```
+
+边界行每次随机生成、保证不出现在片段里；无命中或出错时只有首行 JSON。
 
 **通用口径**（详细规则见各工具的参数描述与 docs/）：
 
@@ -154,7 +176,7 @@ HTTP 模式下附带 4 个端点：
 | 端点 | 用途 |
 |---|---|
 | `GET /health` | 版本、索引规模、构建时间、`rebuilding`、`verifying`、当前配置、source 列表（含目录路径与可用性） |
-| `GET /search?q=…&limit=…&source=…` | 与 MCP `search` 返回结构完全一致 |
+| `GET /search?q=…&limit=…&source=…` | 字段与 MCP `search` 相同，但为完整 JSON（片段在 `results[].snippet` 里），供程序解析 |
 | `GET /recent?limit=…&source=…` | 与 MCP `recent` 返回结构完全一致 |
 | `POST /reindex[?full=1]` | 立即刷新索引；默认增量，`full=1` 全量重建（多人共用下仅管理员，见下文） |
 
@@ -230,7 +252,7 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 | `max_create_chars` | `100000` | 单条记忆正文上限 |
 | `max_cached_docs` | `1000` | 常驻内存的全文篇数上限（LRU）；`0` 不限 |
 | `domain_terms` | `[]` | 领域术语词表，见下 |
-| `allow_mcp_delete` | `false` | **AI 删除断路器**：`true` 时 `delete` 与 `merge`（删源）才对 AI 开放，关闭时两个工具不出现在工具列表 |
+| `allow_mcp_delete` | `false` | **AI 删除断路器**：`true` 时 `delete` 才对 AI 开放，关闭时该工具不出现在工具列表 |
 | `scoring` | 见下 | BM25 之外的打分调整，source 可按字段覆盖 |
 
 **source**：`name` + `dir`（+ 可选 `writable`、`description`、`type`、`scoring`）。
@@ -399,7 +421,7 @@ claude mcp add myMemory --scope user `
    先用 `run.py` 把环境建好，再让客户端直接调。
 2. **`MEMORY_CONFIG` 必须是绝对路径**：客户端启动子进程时的工作目录不确定。
 3. **多个 stdio 进程共用一份 `index.cache`**：各自刷新后原子写回，谁最后写谁生效。
-   需要准确的 `edited_by` 时用 HTTP 模式共享一个实例。
+   需要准确的 `editor` 时用 HTTP 模式共享一个实例。
 
 ---
 
