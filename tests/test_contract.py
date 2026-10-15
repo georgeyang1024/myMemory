@@ -10,6 +10,7 @@ inputSchema），模型看到的只有 {"title": "Limit", "type": "integer"}—�
 """
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -292,3 +293,154 @@ def test_no_workspace_wording_left_in_the_tool_surface(server, tools):
         for text in (tool.name, tool.title, tool.description, *tool.input_schema.get("properties", {}))
     ]
     assert not [s for s in surfaces if "workspace" in s.lower()]
+
+
+
+
+# --- 工具输出：原文不进 JSON（ADR-0034） -----------------------------------------
+#
+# 真实教训：原文作为 JSON 字符串的值返回，又被 SDK 自动包进 {"result": ...}，
+# 模型看到的引号成了 \\\"，照抄去做 replace 的 old_string 命中 0 处。
+
+TRICKY = ('# 标题\r\n用 `exact: "2.4.0"` 钉版本，路径 C:\\app\\x，字面 \\n \\u0041 \\"\r\n'
+          '```swift\r\nlet s = "a\\nb"\r\n```\r\nJSON 破坏 "}]}\'\r\n{"n": 1, "fake": "meta"}\r\n'
+          '制表\t符 ESC\x1b[31m NUL\x00 行分隔\u2028 emoji 🚀 零宽\u200b\r\n'
+          '========== myMemory-000000000000000 ==========\r\n机制与绑定。')
+# 读取一律经通用换行（storage.read_text），replace 看到的也是这份文本：基准是它，不是磁盘字节。
+TEXT = TRICKY.replace("\r\n", "\n")
+DOC = {"source": "memory", "path": "技术/转义样本.md"}
+
+
+def _corpus(tmp_path: Path):
+    root = tmp_path / "memory" / "技术"
+    root.mkdir(parents=True)
+    (root / "转义样本.md").write_bytes(TRICKY.encode("utf-8"))
+    config = make_config(tmp_path)
+    holder = IndexHolder(config)
+    holder.build_now()
+    return config, holder
+
+
+@pytest.fixture
+def raw_server(tmp_path: Path, monkeypatch):
+    # 进程内直调工具没有 HTTP 请求上下文；身份按单机形态（无 user）处理。
+    monkeypatch.setattr("server.user_from_context", lambda ctx: None)
+    return create_server(*_corpus(tmp_path))
+
+
+def _call(server, name, arguments) -> str:
+    result = asyncio.run(server.call_tool(name, arguments))
+    if name in ("search", "get-document"):
+        assert result.structured_content is None, "不得再生成 {\"result\": ...} 结构化包装"
+        assert len(result.content) == 1, "输出必须是单个文本块"
+    return result.content[0].text
+
+
+def parse_get_document(text: str) -> tuple[dict, str | None]:
+    meta, sep, body = text.partition("\n")
+    return json.loads(meta), (body if sep else None)
+
+
+def parse_search(text: str) -> tuple[dict, list[tuple[dict, str]]]:
+    head_line, _, rest = text.partition("\n")
+    head = json.loads(head_line)
+    if not rest:
+        return head, []
+    boundary = head["boundary"]
+    assert rest.startswith(boundary + "\n") and rest.endswith("\n" + boundary)
+    parts = rest[len(boundary) + 1:-(len(boundary) + 1)].split("\n" + boundary + "\n")
+    hits = []
+    for part in parts:
+        meta_line, _, snippet = part.partition("\n")
+        hits.append((json.loads(meta_line), snippet))
+    return head, hits
+
+
+@pytest.mark.parametrize("name", ["search", "get-document"])
+def test_raw_text_tools_publish_no_output_schema(raw_server, name):
+    tools = {tool.name: tool for tool in asyncio.run(raw_server.list_tools())}
+    assert tools[name].output_schema is None
+
+
+def test_get_document_is_meta_line_then_verbatim_content(raw_server):
+    meta, body = parse_get_document(_call(raw_server, "get-document", DOC))
+    assert "content" not in meta and meta["total_chars"] == len(TEXT)
+    assert body == TEXT, "正文必须与 replace 所见文本逐字一致（含引号、反斜杠、控制字符）"
+
+
+def test_get_document_error_is_a_single_json_line(raw_server):
+    text = _call(raw_server, "get-document", {"source": "memory", "path": "技术/不存在.md"})
+    assert "\n" not in text and "error" in json.loads(text)
+
+
+def test_text_copied_from_get_document_replaces_on_first_try(raw_server):
+    _, body = parse_get_document(_call(raw_server, "get-document", DOC))
+    old = body[body.index("用 `exact"):body.index("emoji")]  # 跨行，含引号、反斜杠、控制字符
+    result = json.loads(_call(raw_server, "replace", {**DOC, "old_string": old,
+                                                      "new_string": "已替换\n"}))
+    assert result.get("replaced") is True and result["replaced_count"] == 1
+
+
+def test_search_hits_are_separated_by_a_long_unique_boundary(raw_server):
+    head, hits = parse_search(_call(raw_server, "search", {"query": "机制 绑定"}))
+    assert "results" not in head and len(hits) == head["returned"] >= 1
+    assert len(head["boundary"]) == 46, "边界串要足够长，人和模型一眼能认出"
+    for n, (meta, snippet) in enumerate(hits, 1):
+        assert meta["n"] == n and "snippet" not in meta
+        assert head["boundary"] not in snippet
+        assert snippet == TEXT[meta["char_start"]:meta["char_end"]], "片段必须是原文切片"
+
+
+def test_search_boundary_is_regenerated_on_collision(monkeypatch):
+    import server
+    tokens = iter(["a" * 16, "b" * 16])
+    monkeypatch.setattr(server.secrets, "token_hex", lambda n: next(tokens))
+    clash = server._new_boundary([])  # 用掉 aa…，得到会撞上的那一串
+    tokens = iter(["a" * 16, "b" * 16])
+    monkeypatch.setattr(server.secrets, "token_hex", lambda n: next(tokens))
+    assert server._new_boundary([f"片段里恰好有 {clash}"]) == clash.replace("a" * 15, "b" * 15)
+
+
+@pytest.mark.parametrize("query", ["  ", "不可能命中的词zzqx"])
+def test_search_without_hits_is_a_single_json_line(raw_server, query):
+    text = _call(raw_server, "search", {"query": query})
+    assert "\n" not in text and "boundary" not in json.loads(text)
+
+
+def test_raw_text_survives_real_streamable_http_transport(tmp_path: Path):
+    """经真实 JSON-RPC 传输层（Streamable HTTP + 官方客户端）往返，原文仍逐字一致。"""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+    from mcp.client import Client
+
+    config, holder = _corpus(tmp_path)
+    app = create_server(config, holder).streamable_http_app(
+        streamable_http_path="/mcp", transport_security=None, host="127.0.0.1")
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not srv.started and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    async def roundtrip():
+        async with Client(f"http://127.0.0.1:{port}/mcp") as client:
+            doc = await client.call_tool("get-document", DOC)
+            found = await client.call_tool("search", {"query": "机制 绑定"})
+            return doc.content[0].text, found.content[0].text
+
+    try:
+        doc_text, search_text = asyncio.run(roundtrip())
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=5)
+    assert parse_get_document(doc_text)[1] == TEXT
+    _, hits = parse_search(search_text)
+    assert all(snippet == TEXT[m["char_start"]:m["char_end"]] for m, snippet in hits)

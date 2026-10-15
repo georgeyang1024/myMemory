@@ -9,6 +9,7 @@ import dataclasses
 import difflib
 import json
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Annotated, Any
 from urllib.parse import parse_qs, quote, unquote
@@ -91,15 +92,15 @@ BM25 关键词匹配，不做同义改写：搜不到就换记忆里实际写过
 """
 
 SEARCH_DESCRIPTION = """\
-关键词检索共同记忆，返回带来源的原文片段。默认跨全部 source。
-用于回答"以前记过什么"，或写入前查重。
-BM25 匹配，不做同义改写：搜不到就换记忆里实际写过的词。
-同一文档最多占 2 个结果位；刚 save 的内容几秒后才可搜到。\
+按关键词检索记忆，返回原文片段及其 source / path。默认搜全部 source。
+按字面匹配，不认同义词：搜不到就换原文里可能出现的词。
+结果之间用首行给出的 boundary 行分隔。片段可能不完整，要全文或要修改时用 get-document。\
 """
 
 GET_DOCUMENT_DESCRIPTION = """\
-按 source + path 读一篇原文，支持字符分页（默认与上限 40000）。
-不在索引中会被拒并给出相近候选；掉盘时 stale: true（可能不是最新）。\
+读取一篇记忆的原文，source 与 path 照抄 search 的结果。
+首行是 JSON 元数据，其后是正文，可直接复制作 replace 的 old_string。
+has_more 为 true 时，把 next_offset 作为 offset 再读一次。\
 """
 
 SAVE_DESCRIPTION = """\
@@ -446,6 +447,51 @@ def run_get_document(
     }
 
 
+# --- MCP 工具输出：原文不进 JSON（ADR-0034） ------------------------------------
+#
+# 原文一旦作为 JSON 字符串的值，引号、反斜杠、换行就必须转义，调用方照抄去做
+# replace 的 old_string 会对不上。所以 search / get-document 的工具输出是单个
+# 文本块：元数据一行 JSON（json.dumps 会转义值里的换行，必然只占一行），原文
+# 原样跟在后面。REST 端点不受影响，仍返回 run_* 的完整 JSON（给程序用）。
+
+def _json_line(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _new_boundary(texts: list[str]) -> str:
+    """每次响应随机生成，保证不出现在任何片段里（撞上就重来）。"""
+    while True:
+        boundary = f"{'=' * 10} myMemory-{secrets.token_hex(8)[:15]} {'=' * 10}"
+        if not any(boundary in text for text in texts):
+            return boundary
+
+
+def render_search(payload: dict[str, Any]) -> str:
+    """首行总体信息（含 boundary）；每条命中：边界行、元数据一行、片段原文；末尾再一条边界行。
+
+    无命中或出错时只有首行。
+    """
+    results = payload.get("results", [])
+    head = {k: v for k, v in payload.items() if k != "results"}
+    if not results:
+        return _json_line(head)
+    boundary = _new_boundary([hit["snippet"] for hit in results])
+    lines = [_json_line({**head, "boundary": boundary})]
+    for n, hit in enumerate(results, 1):
+        meta = {"n": n, **{k: v for k, v in hit.items() if k != "snippet"}}
+        lines += [boundary, _json_line(meta), hit["snippet"]]
+    lines.append(boundary)
+    return "\n".join(lines)
+
+
+def render_get_document(payload: dict[str, Any]) -> str:
+    """成功：首行元数据，第一个换行之后全部是正文原文；出错（无 content）：只有一行 JSON。"""
+    if "content" not in payload:
+        return _json_line(payload)
+    meta = {k: v for k, v in payload.items() if k != "content"}
+    return _json_line(meta) + "\n" + payload["content"]
+
+
 def run_save(config: Config, holder: IndexHolder, source: str,
              category: str, filename: str, content: str,
              editor: str | None = None) -> dict[str, Any]:
@@ -692,6 +738,7 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         name="search",
         title="检索共同记忆",
         description=SEARCH_DESCRIPTION,
+        structured_output=False,
     )
     def tool_search(
         ctx: Context,
@@ -709,12 +756,13 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
     ) -> str:
         scoped, allowed, _editor = _session(ctx)
         payload = run_search(scoped, holder.snapshot, query, limit, source, allowed)
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return render_search(payload)
 
     @server.tool(
         name="get-document",
         title="读取记忆原文（可分页）",
         description=GET_DOCUMENT_DESCRIPTION,
+        structured_output=False,
     )
     def tool_get_document(
         ctx: Context,
@@ -726,7 +774,7 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
             "不含 source 名。普遍含中文与空格，不要自行拼接或猜测。"
         ))],
         offset: Annotated[int, Field(description=(
-            "起始字符偏移，默认 0。翻页时把上次响应的 next_offset 传回。"
+            "起始字符位置，默认 0；续读时传 next_offset。"
         ))] = 0,
         limit: Annotated[int, Field(description=(
             "本次返回字符数，上限 40000（也是默认值）。越界自动钳制。"
@@ -735,7 +783,7 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         scoped, allowed, _editor = _session(ctx)
         payload = run_get_document(scoped, holder.snapshot, source, path, offset, limit,
                                    allowed)
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return render_get_document(payload)
 
     @server.tool(
         name="save",

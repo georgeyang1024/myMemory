@@ -111,25 +111,50 @@ python3 run.py --logs         # Tail logs (Ctrl-C only exits the tail, service i
 
 ## MCP tools
 
-7 tools always present + 2 deletion tools (hidden by default); the full names clients see
+7 tools always present + `delete` (hidden by default); the full names clients see
 look like `mcp__myMemory__save` (client concatenates server name + tool name).
 
 | Tool | One-line description |
 |---|---|
-| `search(query, limit=10, source="")` | BM25 full-text search across all sources by default; returns raw snippets with `source`/`path`/`writable`. Source names, categories, file names, dates (`26-08-04`), and model-style identifiers all work directly as query terms |
-| `get-document(source, path, offset=0, limit=40000)` | Read the raw document, character-level pagination; response includes `writable` and `stale` (content from cache while the disk is offline) |
+| `search(query, limit=10, source="")` | BM25 full-text search across all sources by default; returns raw snippets². Source names, categories, file names, dates (`26-08-04`), and model-style identifiers all work directly as query terms |
+| `get-document(source, path, offset=0, limit=40000)` | Read the raw document², character-level pagination; metadata includes `writable` and `stale` (content from cache while the disk is offline) |
 | `save(source, filename, content, category="")` | Write a memory to `<source>/<category>/<filename>.md`; **overwrites the whole file if it already exists** (irreversible, no backup); empty content rejected |
 | `rename(source, old_path, new_path)` | Rename/move a top-level category within the same source; the old file must exist, **rejects if the target exists**, never overwrites |
 | `replace(source, path, old_string, new_string)` | **Strictly literal** replace of old→new across the file (no regex, no case folding); replaces every occurrence and returns `replaced_count`; 0 hits or empty `new_string` rejected |
 | `list-sources()` | List all sources (`writable`/`available`/`doc_count`…), **does not return directory paths**; pick your write target from here |
-| `recent(limit=10, source="")` | Most recently updated, one entry per file; `edited_by` distinguishes `agent` (written via tools) from `scan` (human edits or out-of-band changes) |
-| `merge(source, from_path, to_path)`¹ | Merge one **existing** memory into another (merged section gets a `## Source` heading and a `---` divider), then **deletes the source file**; writes first, deletes second; if deletion fails, flagged with `source_removed: false` |
+| `recent(limit=10, source="")` | Most recently updated, one entry per file; `editor` distinguishes `agent` (written via tools) from `scan` (human edits or out-of-band changes); in multi-user mode it records the writer's identity |
 | `delete(source, path)`¹ | **Real deletion** (no backup, unrecoverable); `path` has the same shape as `search` results |
 
-> ¹ Both `merge` / `delete` really delete files and are gated by the config switch
-> `allow_mcp_delete` (default `false`, takes effect on restart). When off, the tools do
+> ¹ `delete` really deletes files and is gated by the config switch
+> `allow_mcp_delete` (default `false`, takes effect on restart). When off, the tool does
 > not even appear in tools/list — what the LLM cannot see it cannot call; enabling
-> requires a manual config change.
+> requires a manual config change. `merge` was removed in 0.5.0
+> ([ADR-0032](docs/adr/0032-remove-merge-tool.md)).
+>
+> ² Raw text is not escaped and can be copied verbatim as `replace`'s `old_string`; format
+> below ([ADR-0034](docs/adr/0034-raw-text-tool-output.md)).
+
+**Output format of `search` / `get-document`**: a single text block — one line of JSON
+metadata, followed by the raw text as-is.
+
+```text
+get-document:
+{"source": "memory", "path": "tech/note.md", "total_chars": 1200, "has_more": false, ...}
+Raw document text… (everything after the first newline)
+
+search:
+{"query": "…", "total_matched": 12, "returned": 2, "boundary": "========== myMemory-7f3a9c2e41d0b8a ==========", ...}
+========== myMemory-7f3a9c2e41d0b8a ==========
+{"n": 1, "source": "memory", "path": "tech/note.md", "char_start": 0, "char_end": 800, ...}
+Raw snippet…
+========== myMemory-7f3a9c2e41d0b8a ==========
+{"n": 2, ...}
+Raw snippet…
+========== myMemory-7f3a9c2e41d0b8a ==========
+```
+
+The boundary is random per response and guaranteed not to occur in any snippet; with no
+hits or on error, only the first JSON line is returned.
 
 **Common conventions** (detailed rules in each tool's parameter descriptions and docs/):
 
@@ -155,7 +180,7 @@ look like `mcp__myMemory__save` (client concatenates server name + tool name).
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Version, index size, build time, `rebuilding`, `verifying`, current config, source list (with directory paths and availability) |
-| `GET /search?q=…&limit=…&source=…` | Identical response structure to MCP `search` |
+| `GET /search?q=…&limit=…&source=…` | Same fields as MCP `search`, but as full JSON (snippets inside `results[].snippet`) for programs to parse |
 | `GET /recent?limit=…&source=…` | Identical response structure to MCP `recent` |
 | `POST /reindex[?full=1]` | Refresh the index immediately; incremental by default, `full=1` for a full rebuild (admin-only under multi-user shared mode, see below) |
 
@@ -233,7 +258,7 @@ data. Config changes **always require a restart to take effect**.
 | `max_create_chars` | `100000` | Max content length per memory |
 | `max_cached_docs` | `1000` | Max full texts kept in memory (LRU); `0` unlimited |
 | `domain_terms` | `[]` | Domain term list, see below |
-| `allow_mcp_delete` | `false` | **AI deletion circuit breaker**: only when `true` are `delete` and `merge` (source deletion) exposed to AI; when off, the two tools do not appear in the tool list |
+| `allow_mcp_delete` | `false` | **AI deletion circuit breaker**: only when `true` is `delete` exposed to AI; when off, the tool does not appear in the tool list |
 | `scoring` | see below | Score adjustments on top of BM25; sources can override per field |
 
 **source**: `name` + `dir` (+ optional `writable`, `description`, `type`, `scoring`).
@@ -430,7 +455,7 @@ Three key points:
 2. **`MEMORY_CONFIG` must be an absolute path**: the working directory when the client
    spawns the subprocess is unpredictable.
 3. **Multiple stdio processes share one `index.cache`**: each writes back atomically
-   after refreshing, last writer wins. When accurate `edited_by` matters, use HTTP mode
+   after refreshing, last writer wins. When accurate `editor` matters, use HTTP mode
    with a shared instance.
 
 ---
