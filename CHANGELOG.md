@@ -10,6 +10,37 @@
 
 ---
 
+## [0.7.0] · 2026-10-16
+
+详见 [ADR-0035](docs/adr/0035-wikilink-graph.md)。
+
+### 新增
+
+- **关联图**：文档间统一用 Obsidian 式 `[[链接]]` 关联。`search` 每条命中附 `related`——
+  同一 source 内与它有链接（出链或反链）的文档 path，最多 3 篇；超过时稳定地随机抽取，
+  文档或其关联变了才重新抽。不跨 source
+- `save` 工具说明提示 AI 用 `[[分类/文件名.md]]`（照抄 search 返回的 path，含分类）关联同 source 的已有记忆（Obsidian 图谱可见）
+- 配置 `link_graph`（系统级，默认 `true`，重启生效）；CLI `config set link_graph <true|false>`
+- 配置 `auto_save`（系统级，默认 `false`，重启生效）：开启后服务总说明才含「主动保存」；CLI `config set auto_save <true|false>`；
+  MCP URL `?auto_save=true/false` 按连接覆盖（[ADR-0036](docs/adr/0036-auto-save-switch.md)）
+
+### 变更
+
+- 索引缓存格式升到 5（条目记录链接目标），升级后首次启动全量重建一次
+- 服务总说明（instructions）重写：句子更短、更直白，适配能力较弱的模型；新增「主动保存」（受 `auto_save` 控制）——
+  踩坑与解决办法、命令技巧、决定、用户偏好直接 save 不用先问，保存后告知位置，不存密码密钥；
+  已有记忆用 replace 修改不重复新建
+- 工具说明修订：replace 的 old_string 须从 get-document 原文复制；save 没有 path 参数；source 不是用户名
+
+### 修复
+
+- 测试套件封闭化：代理环境变量（如 `all_proxy=socks://…`）会让 MCP 官方客户端启动即失败
+  （httpx 不认识 `socks://`），连带一个契约测试挂掉；conftest 启动时统一摘掉代理变量
+- 团队建档提示测试改用 `tmp_path`，不再把 `E:/x/config.json` 写进仓库
+  （Windows 时代的路径；在 Linux 上是相对路径，此前每次 pytest 都会在仓库里重建）
+
+---
+
 ## [0.6.0] · 2026-10-15
 
 详见 [ADR-0034](docs/adr/0034-raw-text-tool-output.md)。

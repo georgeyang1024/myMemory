@@ -75,6 +75,13 @@ DEFAULTS: dict[str, Any] = {
     # 默认 False：删除不可备份不可恢复，关闭时这两个工具对 AI 彻底隐藏，
     # 要开启需人工改配置并重启——这是心智上的断路器，不是运行时开关。
     "allow_mcp_delete": False,
+    # 关联图（docs/adr/0035）：search 每条命中附同 source 内经 [[链接]] 关联的文档
+    # （出链或反链，至多 3 篇），save 的工具说明提示 AI 用 [[源内完整 path]] 建立关联。
+    # 系统级开关，默认开；与 allow_mcp_delete 一样改配置后重启生效。
+    "link_graph": True,
+    # 主动保存：服务总说明（instructions）里加「主动保存」一节，引导 AI 不经询问
+    # 直接 save 经验、踩坑、偏好。系统级开关，默认关；改配置后重启生效。
+    "auto_save": False,
     # 多人共用形态（docs/adr/0028 ~ 0031）：store_dir 必填、admins 可选
     # （缺省时默认 ["admin"]）、guest_writable 默认 false（访客对公共 source
     # 一律只读）。enabled 是显式开关，默认 false：multi_user 块可以预先配好
@@ -624,6 +631,8 @@ class Config:
     max_query_chars: int = field(default=500)
     domain_terms: tuple[str, ...] = field(default=())
     allow_mcp_delete: bool = field(default=False)
+    link_graph: bool = field(default=True)
+    auto_save: bool = field(default=False)
     multi_user: MultiUserConfig | None = field(default=None)
     scoring: Scoring = field(default_factory=Scoring)
 
@@ -683,6 +692,14 @@ class Config:
         if not isinstance(allow_mcp_delete, bool):
             raise ConfigError("allow_mcp_delete 必须是 true 或 false")
 
+        link_graph = data.get("link_graph", DEFAULTS["link_graph"])
+        if not isinstance(link_graph, bool):
+            raise ConfigError("link_graph 必须是 true 或 false")
+
+        auto_save = data.get("auto_save", DEFAULTS["auto_save"])
+        if not isinstance(auto_save, bool):
+            raise ConfigError("auto_save 必须是 true 或 false")
+
         multi_user = parse_multi_user(raw_multi_user, sources)
 
         # 全局值在默认值之上覆盖，source 再在全局值之上按字段覆盖。
@@ -717,6 +734,8 @@ class Config:
             max_cached_docs=_int_field(data, "max_cached_docs"),
             domain_terms=domain_terms,
             allow_mcp_delete=allow_mcp_delete,
+            link_graph=link_graph,
+            auto_save=auto_save,
             multi_user=multi_user,
             scoring=scoring,
         )
@@ -764,6 +783,8 @@ class Config:
             "max_cached_docs": self.max_cached_docs,
             "domain_terms": len(self.domain_terms),
             "allow_mcp_delete": self.allow_mcp_delete,
+            "link_graph": self.link_graph,
+            "auto_save": self.auto_save,
             # 全局有效值，以及与之不同的 source 有效值
             "scoring": {
                 "default": dataclasses.asdict(self.scoring),

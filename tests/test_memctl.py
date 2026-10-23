@@ -230,6 +230,24 @@ def test_set_allow_mcp_delete_rejects_non_boolean(env, value):
     assert config.read_bytes() == before, "校验失败不得改配置文件"
 
 
+def test_set_link_graph(env):
+    _, config = env
+    assert data(config).get("link_graph", True) is True, "默认必须开"
+    assert config_cli.main(["config", "set", "link_graph", "false"]) == 0
+    assert data(config)["link_graph"] is False
+    assert config_cli.main(["config", "set", "link_graph", "true"]) == 0
+    assert data(config)["link_graph"] is True
+
+
+def test_set_auto_save(env):
+    _, config = env
+    assert data(config).get("auto_save", False) is False, "默认必须关"
+    assert config_cli.main(["config", "set", "auto_save", "true"]) == 0
+    assert data(config)["auto_save"] is True
+    assert config_cli.main(["config", "set", "auto_save", "false"]) == 0
+    assert data(config)["auto_save"] is False
+
+
 def test_only_poll_interval_is_settable(env):
     with pytest.raises(SystemExit):
         config_cli.main(["config", "set", "port", "8080"])

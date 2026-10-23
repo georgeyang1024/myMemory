@@ -34,6 +34,7 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 - **全文检索**：BM25 关键词匹配 + jieba 分词，无向量、无外部服务
 - **打分可调**：近期修改、路径命中的文档加分，类似的文档旧文档降级（`scoring`）
 - **证据而非答案**：检索返回带来源（source + path）的原文片段，结论由 AI 自己写
+- **关联图**：文档间用 Obsidian 式 `[[链接]]` 关联，检索命中附带同 source 内的关联文档（`link_graph`）
 - **启动快**：索引持久化缓存，启动先用缓存应答、后台增量校验
 - **掉盘可用**：挂载盘临时掉线时，索引与缓存原样保留，照常检索与读取
 - **可写面收敛**：按配置区分只读 / 可写 source；AI 只能写显式可写的 source
@@ -146,7 +147,7 @@ get-document：
 search：
 {"query": "…", "total_matched": 12, "returned": 2, "boundary": "========== myMemory-7f3a9c2e41d0b8a ==========", ...}
 ========== myMemory-7f3a9c2e41d0b8a ==========
-{"n": 1, "source": "memory", "path": "技术/笔记.md", "char_start": 0, "char_end": 800, ...}
+{"n": 1, "source": "memory", "path": "技术/笔记.md", "char_start": 0, "char_end": 800, ..., "related": ["技术/方案.md"]}
 片段原文……
 ========== myMemory-7f3a9c2e41d0b8a ==========
 {"n": 2, ...}
@@ -155,6 +156,12 @@ search：
 ```
 
 边界行每次随机生成、保证不出现在片段里；无命中或出错时只有首行 JSON。
+
+**关联文档 `related`**（`link_graph` 开启时，默认开）：命中文档与同一 source 内其它文档之间
+有 `[[链接]]`（出链或反链）时，附最多 3 个关联文档的 `path`；超过 3 篇时随机抽取，文档或其关联
+变了才重新抽。链接按 Obsidian 习惯解析（`[[文件名]]` / `[[分类/文件名]]`，可带 `|别名`、`#标题`，
+大小写不敏感，同名取路径最短），不跨 source。`save` 的工具说明会提示 AI 照抄 search 返回的 path 写成 `[[分类/文件名.md]]`（含分类，不删减）建立关联，
+Obsidian 打开记忆目录即可在图谱中看到。详见 [ADR-0035](docs/adr/0035-wikilink-graph.md)。
 
 **通用口径**（详细规则见各工具的参数描述与 docs/）：
 
@@ -253,6 +260,8 @@ curl.exe -X POST http://127.0.0.1:7083/reindex
 | `max_cached_docs` | `1000` | 常驻内存的全文篇数上限（LRU）；`0` 不限 |
 | `domain_terms` | `[]` | 领域术语词表，见下 |
 | `allow_mcp_delete` | `false` | **AI 删除断路器**：`true` 时 `delete` 才对 AI 开放，关闭时该工具不出现在工具列表 |
+| `link_graph` | `true` | **关联图**：`search` 命中附 `[[链接]]` 关联文档（`related`），`save` 说明提示 AI 建关联；`false` 两者都去掉（重启生效） |
+| `auto_save` | `false` | **主动保存**：服务总说明加「主动保存」一节，引导 AI 不经询问直接保存经验、踩坑、偏好（重启生效）；MCP URL 加 `?auto_save=true/false` 可按连接覆盖，见 [ADR-0036](docs/adr/0036-auto-save-switch.md) |
 | `scoring` | 见下 | BM25 之外的打分调整，source 可按字段覆盖 |
 
 **source**：`name` + `dir`（+ 可选 `writable`、`description`、`type`、`scoring`）。
@@ -317,6 +326,8 @@ python3 config.py source remove <名称> [--yes] [--restart]
 python3 config.py config set poll_interval <秒> [--restart]
 python3 config.py config set max_cached_docs <篇> [--restart]
 python3 config.py config set allow_mcp_delete <true|false> [--restart]   # AI 删除开关，默认 false
+python3 config.py config set link_graph <true|false> [--restart]         # 关联图开关，默认 true
+python3 config.py config set auto_save <true|false> [--restart]          # 主动保存开关，默认 false
 python3 config.py config edit   --scoring <字段>=<值> [--scoring …] [--reset-scoring <字段>|all] [--restart]   # 全局打分调整
 python3 config.py source edit   <名称> --scoring <字段>=<值> [--scoring …] [--reset-scoring <字段>|all] [--restart]
 python3 config.py reindex [--full]        # 立即增量刷新（--full 全量），不用重启

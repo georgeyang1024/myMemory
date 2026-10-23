@@ -376,6 +376,16 @@ def test_middleware_no_user_strips_client_header(tmp_path: Path):
     assert status == 200 and body["user"] is None, "客户端自带的内部头必须被无条件删除"
 
 
+@pytest.mark.parametrize("value", ["maybe", "2"])
+def test_middleware_rejects_invalid_auto_save(tmp_path: Path, value: str):
+    """?auto_save= 非法值在 /mcp 上 400（ADR-0036），不静默回退系统配置。"""
+    app = UserScopeMiddleware(echo_app, make_multi_config(tmp_path))
+    status, body = call(app, "GET", "/mcp", f"auto_save={value}")
+    assert status == 400 and "auto_save" in body["error"]
+    status, _body = call(app, "GET", "/mcp", "auto_save=On")
+    assert status == 200
+
+
 def test_middleware_valid_user_injects_percent_encoded_header(tmp_path: Path):
     (tmp_path / "users" / "张三").mkdir(parents=True, exist_ok=True)
     config = make_multi_config(tmp_path)
@@ -707,7 +717,7 @@ def test_editor_cache_roundtrip(tmp_path: Path):
     _wait_idle(restarted)
     entry = restarted.snapshot.entries[("alice", "丙.md")]
     assert entry.agent_editor == "alice" and entry.editor == "alice", "agent_editor 跨重启保留"
-    assert CACHE_FORMAT == 4
+    assert CACHE_FORMAT == 5
 
 
 def test_editor_values_survive_cache_rescue(tmp_path: Path):
