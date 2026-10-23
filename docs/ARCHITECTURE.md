@@ -238,6 +238,8 @@ BM25 全文检索，默认跨全部 source；`source` 可选。
 同一文档最多先占 2 个结果位；入参越界钳制而非报错。
 `score` = BM25 分 + 路径命中加分 + 时间加分，加分只改变命中之间的排序，不改变命中集合；
 `scoring.strip_wikilinks` 在分词前去掉 `[[...]]`（[ADR-0027](adr/0027-search-scoring-adjustments.md)）。
+`link_graph` 开启（默认）时，命中可带 `"related": ["<path>", …]`：同 source 内经 `[[链接]]`
+关联（出链或反链）的文档，最多 3 篇，无关联时省略该字段（[ADR-0035](adr/0035-wikilink-graph.md)）。
 
 ### 6.2 `get-document(source, path, offset=0, limit=40000)`
 
@@ -446,5 +448,7 @@ source 决定了"什么能被读、什么能被写"。它若能经 MCP 修改，
 | [0030](adr/0030-multi-user-config-and-admin-full-scope.md) | 管理员 | `multi_user` 配置子项（`enabled` 开关默认 false、store_dir 必填、admins 可选默认 `["admin"]`、guest_writable 默认 false）；管理员全域单会话 |
 | [0031](adr/0031-editor-attribution.md) | 编辑者登记 | `edited_by` 更名 `editor` 并登记路由身份（用户名/管理员名/guest）；CACHE_FORMAT 3→4 |
 | [0032](adr/0032-remove-merge-tool.md) | merge 移除 | 工具+实现连删；allow_mcp_delete 语义收窄为只管 delete |
+| [0035](adr/0035-wikilink-graph.md) | 关联图 | `[[链接]]` 同 source 内解析成无向邻接；search 命中附 `related`（≤3，稳定抽样）；`link_graph` 系统开关默认开；CACHE_FORMAT 4→5 |
+| [0036](adr/0036-auto-save-switch.md) | 主动保存开关 | `auto_save` 系统配置默认关；`/mcp?auto_save=` 按连接覆盖，只改握手 instructions；非法值 400 |
 
 术语定义见 [GLOSSARY.md](GLOSSARY.md)。

@@ -60,41 +60,71 @@ def _user_from_query(query_string: bytes) -> str | None:
     name = values[0].strip()
     return name or None
 
+
+# ?auto_save= 的取值（ADR-0036）：大小写不敏感；空值视同缺省（沿用系统配置）。
+_AUTO_SAVE_WORDS = {"true": True, "1": True, "yes": True, "on": True,
+                    "false": False, "0": False, "no": False, "off": False}
+_INVALID = object()
+
+
+def _auto_save_from_query(query_string: bytes) -> Any:
+    """解析 ?auto_save=：缺失/空白 → None（沿用系统配置）；不认识的值 → _INVALID。"""
+    pairs = query_string.decode("utf-8", "replace")
+    values = parse_qs(pairs, keep_blank_values=True).get("auto_save")
+    if not values or not values[0].strip():
+        return None
+    return _AUTO_SAVE_WORDS.get(values[0].strip().lower(), _INVALID)
+
 SERVER_INSTRUCTIONS = """\
-操作者（人）与 AI 共同的记忆系统。双方都往里写、都从里读。
-主题不限、范围不限——工作、技术、生活、想法都可能在里面。
+人与 AI 共同的记忆系统，双方都读、都写。主题不限：工作、技术、生活都可以。
+人也会用编辑器直接改这些文件。
 
 记忆是本机上的 Markdown 文件，本质是跨会话的长期记忆。
-本次对话值得复用的结论、决定、上下文，显式 `save` 一篇，不要只留在对话里。
+{auto_save}
+## 使用规则
+1. 动手前先 search，看看以前有没有记过。
+2. 改已有记忆：search 找到 → get-document 读原文 → 从原文复制 old_string → replace。
+   不要从 search 片段复制，也不要用 save 整篇覆盖。
+3. 新建用 save：同名会直接覆盖，save 前先确认 search 搜不到同名文件。
+   分类只有一级，如 技术、工作；不存在会自动创建。
+4. source 只能用 list-sources 返回的名称（不是用户名），只写入 writable 为 true 的。
+5. 返回的是原文片段，不是答案。结论自己写，并注明 source 和 path。
 
-## 形态
-
-- 记忆分属若干'source'（个人、团队、组织……），一篇记忆 = `source` + `path`。
-- 有哪些 source、哪些可写：调 `list-sources`；每条返回都带 `writable`。
-- 你：`save` 写入（分类只有一级，不存在会自动创建，可为空写在根目录）。
-- 人：随时用编辑器直接增删改，改动照常进索引。
-
-## 两条规矩
-
-1. 返回的是*原文片段，不是答案*。结论由你写，并标注来源。
-2. 写入前先 `search`：同名会直接覆盖。
-
-## 检索特性
-
-BM25 关键词匹配，不做同义改写：搜不到就换记忆里实际写过的词，
-或用 source 名、分类名、文件名、日期（`26-08-04`）这类专有名词定位。
-
-## 多人共用
-
-多人共用部署时一个会话只包含公共 source 与本人（或管理员全域）的
-个人 source：`list-sources` 返回即本会话全集，`search` / `recent`
-默认检索也只覆盖这个范围；会话之外的 source 按"不存在"拒绝。\
+## 检索
+按 BM25 关键词字面匹配，不做同义改写。搜不到就换个词，
+或用 source 名、分类名、文件名、日期（26-08-04）、名词搜。\
 """
+
+# auto_save 开启时插入 instructions 的「主动保存」一节。
+AUTO_SAVE_NOTE = """
+## 主动保存
+非模型训练知识、方法论、踩坑、用户偏好习惯、特有事实现状、学习沉淀，可以直接 save，不用先问用户。
+保存后用一句话告诉用户存到了哪里。不要保存密码、密钥。
+"""
+
+
+def server_instructions(config: Config, auto_save: bool | None = None) -> str:
+    """服务总说明；auto_save 开启时才含「主动保存」一节。
+
+    auto_save 为 None 时取系统配置；URL 参数 ?auto_save= 覆盖时传入布尔值（ADR-0036）。
+    """
+    enabled = config.auto_save if auto_save is None else auto_save
+    return SERVER_INSTRUCTIONS.format(auto_save=AUTO_SAVE_NOTE if enabled else "")
 
 SEARCH_DESCRIPTION = """\
 按关键词检索记忆，返回原文片段及其 source / path。默认搜全部 source。
 按字面匹配，不认同义词：搜不到就换原文里可能出现的词。
 结果之间用首行给出的 boundary 行分隔。片段可能不完整，要全文或要修改时用 get-document。\
+"""
+
+# link_graph 开启时追加到 search / save 的工具说明（ADR-0035）。
+SEARCH_LINK_NOTE = """
+related 是与该结果相关的其它文档 path，可用 get-document 读取。\
+"""
+
+SAVE_LINK_NOTE = """
+content 里提到同一 source 的其它记忆时，加上链接 [[分类/文件名.md]] ，例如 [[工作/周报.md]] 或 [[备忘.md]]。
+分类和文件名照抄 search 结果里的 path。\
 """
 
 GET_DOCUMENT_DESCRIPTION = """\
@@ -104,9 +134,10 @@ has_more 为 true 时，把 next_offset 作为 offset 再读一次。\
 """
 
 SAVE_DESCRIPTION = """\
-写 <source>/<分类>/<文件名>.md。同名直接覆盖，不存在则新建。
-source 必填且必须 writable 为 true；category 只有一级，不存在会自动创建，可为空；content 整篇替换。
-索引异步刷新，刚写完搜不到不代表失败；path 就是凭据，不要重试。\
+新建或整篇覆盖一篇记忆，文件位置是 <source>/<category>/<filename>.md。
+参数是 category + filename，没有 path 参数（例：category="工作", filename="周报"）。
+category 只有一级，不存在会自动创建，可为空。同名直接覆盖；改已有记忆的局部内容用 replace。
+索引异步刷新，刚写完几秒内 search / get-document 可能搜不到，不代表失败，不要重复 save。\
 """
 
 LIST_SOURCES_DESCRIPTION = """\
@@ -116,11 +147,9 @@ description 说明该 source 放什么，用来判断一条记忆该写到哪里
 """
 
 RECENT_DESCRIPTION = """\
-最近更新的文档，按时间倒序，每文件一条。
-editor 登记"谁动的"：agent（经写入工具写入且之后未被改动）/ scan（扫描发现改动，
-可能是人改的，也可能是别的设备或程序改的）；多人共用形态下经 MCP 写入记路由身份
-（用户名 / 管理员名 / guest）。
-绕过本服务的改动要等下一次索引刷新后才出现。\
+最近更新的文档，按时间倒序，每文件一条，返回 source 与 path。
+editor 表示谁改的：agent 是经本工具写入，scan 是人或其它程序改的。
+人直接改文件的变动要等下一次索引刷新后才出现。找到的 path 可直接用于 get-document。\
 """
 
 RENAME_DESCRIPTION = """\
@@ -129,15 +158,14 @@ RENAME_DESCRIPTION = """\
 """
 
 REPLACE_DESCRIPTION = """\
-在一篇记忆的全文里做字面替换 old_string → new_string，命中几处换几处，返回替换次数。
-完全字面匹配：空格与换行必须逐字一致，不做正则、不做大小写折叠、不归一化换行。
-old_string 命中 0 处或 new_string 为空都会被拒绝且不改动文件；整篇重写请改用 save。
-path 支持多层目录的文件编辑（编辑的文件必须已存在）。\
+在一篇已存在的记忆里做字面替换 old_string → new_string，命中几处换几处。
+old_string 必须从 get-document 的正文里原样复制，不要从 search 片段复制，不要自己加反斜杠转义。
+空格与换行必须逐字一致。命中 0 处时不改文件；new_string 不能为空；整篇重写用 save。\
 """
 
 DELETE_DESCRIPTION = """\
-真删一篇记忆：无备份、不可恢复。删除能力默认关，开启后才出现在工具列表。
-path 原样取自 search/recent 的返回值；删除是最终操作，删错只能重新 save。\
+删除一篇记忆，无备份、不可恢复，删错只能重新 save。
+source 与 path 原样取自 search / recent 的返回值，不要自己拼接。只在用户明确要求删除时使用。\
 """
 
 
@@ -268,6 +296,10 @@ class UserScopeMiddleware:
         if normalized not in _VALIDATED_PATHS:
             await self.app(scope, receive, send)
             return
+        if normalized == "/mcp" and _auto_save_from_query(
+                scope.get("query_string") or b"") is _INVALID:
+            await self._send_400(send, "auto_save 只接受 true/false（或 1/0、yes/no、on/off）")
+            return
         headers = [(key, value) for key, value in scope.get("headers", [])
                    if key.lower() != _USER_HEADER_BYTES]
         name = _user_from_query(scope.get("query_string") or b"")
@@ -286,10 +318,12 @@ class UserScopeMiddleware:
         await self._reject(send, name)
 
     async def _reject(self, send, name: str) -> None:  # noqa: ANN001
-        body = json.dumps(
-            {"error": f"user 不存在：{name}。该用户未开通（个人根目录下无此目录）"
-                       "或不在管理员名单中，请联系管理员开通后重试"},
-            ensure_ascii=False).encode("utf-8")
+        await self._send_400(send, f"user 不存在：{name}。该用户未开通（个人根目录下无此目录）"
+                                   "或不在管理员名单中，请联系管理员开通后重试")
+
+    @staticmethod
+    async def _send_400(send, message: str) -> None:  # noqa: ANN001
+        body = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
         await send({"type": "http.response.start", "status": 400, "headers": [
             (b"content-type", b"application/json; charset=utf-8"),
             (b"content-length", str(len(body)).encode("ascii")),
@@ -345,16 +379,21 @@ def run_search(config: Config, snapshot: IndexSnapshot, query: str, limit: Any,
     )
     total, hits = snapshot.search(query, effective_limit, source=scope,
                                   allowed_sources=allowed_sources)
+    results = []
+    for hit in hits:
+        item = _serialize_hit(hit, config.snippet_chars, _writable(config, snapshot, hit.source))
+        # 关联文档与命中同 source，不会越出会话范围（ADR-0035）。
+        related = snapshot.related(hit.source, hit.path) if config.link_graph else []
+        if related:
+            item["related"] = related
+        results.append(item)
     return {
         "index": meta,
         "query": query,
         "source": scope,
         "total_matched": total,
         "returned": len(hits),
-        "results": [
-            _serialize_hit(hit, config.snippet_chars, _writable(config, snapshot, hit.source))
-            for hit in hits
-        ],
+        "results": results,
     }
 
 
@@ -725,8 +764,25 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         name="myMemory",
         title="人与 AI 的共同记忆",
         version=VERSION,
-        instructions=SERVER_INSTRUCTIONS,
+        instructions=server_instructions(config),
     )
+
+    async def auto_save_override(ctx, call_next):  # noqa: ANN001
+        """?auto_save= 覆盖系统配置（ADR-0036）：只改握手结果里的 instructions。
+
+        instructions 只随 initialize（及新协议的 server/discover）下发，所以只在这两处改写；
+        stdio 没有 URL，ctx.request 为 None，恒用系统配置。非法值已在 UserScopeMiddleware 400。
+        """
+        result = await call_next(ctx)
+        if ctx.method not in ("initialize", "server/discover") or not isinstance(result, dict):
+            return result
+        scope = getattr(ctx.request, "scope", None) or {}
+        override = _auto_save_from_query(scope.get("query_string") or b"")
+        if isinstance(override, bool) and "instructions" in result:
+            result = {**result, "instructions": server_instructions(config, override)}
+        return result
+
+    server.middleware.append(auto_save_override)
 
     def _session(ctx: Context) -> tuple[Config, frozenset[str], str | None]:
         """一次工具调用的会话三件套：限域配置、范围名集、编辑者身份。"""
@@ -737,7 +793,7 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
     @server.tool(
         name="search",
         title="检索共同记忆",
-        description=SEARCH_DESCRIPTION,
+        description=SEARCH_DESCRIPTION + (SEARCH_LINK_NOTE if config.link_graph else ""),
         structured_output=False,
     )
     def tool_search(
@@ -788,15 +844,16 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
     @server.tool(
         name="save",
         title="写入记忆（新建或覆盖）",
-        description=SAVE_DESCRIPTION,
+        description=SAVE_DESCRIPTION + (SAVE_LINK_NOTE if config.link_graph else ""),
     )
     def tool_save(
         ctx: Context,
         source: Annotated[str, Field(description=(
-            "必填。要写入的 source，必须可写（list-sources 里 writable 为 true）。"
+            "必填。要写入的 source 名，取自 list-sources（不是用户名），"
+            "必须 writable 为 true。"
         ))],
         filename: Annotated[str, Field(description=(
-            "文件名，.md 可带可不带，可含 ()[] 等常用符号。"
+            "文件名，不含分类和 /，.md 可带可不带，可含 ()[] 等常用符号。"
             "它和 source、category 一起决定覆盖谁——同名直接覆盖。"
         ))],
         content: Annotated[str, Field(description=(
@@ -847,11 +904,11 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         ))],
         path: Annotated[str, Field(description=(
             "文件路径，原样复制自 search/recent 返回的 path，"
-            "不含 source 名，.md 后缀可带可不带。支持多层目录的文件，"
-            "须已存在（先 search 确认）。"
+            "不含 source 名，.md 后缀可带可不带。文件须已存在。"
         ))],
         old_string: Annotated[str, Field(description=(
-            "要被替换的原文片段，必须逐字一致，建议连同少量上下文保证唯一。"
+            "要被替换的原文片段，取自 get-document 的正文，逐字一致，"
+            "不要加反斜杠转义。建议连同少量上下文保证唯一。"
         ))],
         new_string: Annotated[str, Field(description=(
             "替换后的文本，不能为空。要删除内容时请传改写后的剩余句子。"

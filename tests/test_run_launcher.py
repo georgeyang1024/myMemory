@@ -475,10 +475,10 @@ def test_ensure_config_team_bootstrap(tmp_path, monkeypatch, capsys):
     assert loaded.multi_user.admins == ("admin",)
 
 
-def test_write_team_config_hints(capsys):
+def test_write_team_config_hints(tmp_path, capsys):
     """团队建档完成后的提示：子文件夹即成员、MCP 接入方式（?user=）、公共 source 补充。"""
-    run.write_team_config(Path("E:/x/config.json"), run.load_config_module(),
-                          Path("E:/x/users"), ["admin"])
+    run.write_team_config(tmp_path / "config.json", run.load_config_module(),
+                          tmp_path / "users", ["admin"])
     out = capsys.readouterr().out
     assert "团队成员" in out and "子文件夹" in out
     assert "http://<服务器>:7083/mcp?user=<成员名>" in out

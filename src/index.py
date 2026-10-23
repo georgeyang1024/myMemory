@@ -12,6 +12,8 @@
 - 条目与 BM25 模型持久化为 index.cache：启动先用缓存立即服务，后台再增量校验。
 - 挂载盘掉线时，该 source 的条目原样保留，不更新、不删除
   （docs/adr/0020-mounted-disk-offline.md）。
+- 关联图：条目记下正文里的 [[链接]] 目标，快照按需在同一 source 内解析成
+  无向邻接，search 据此附关联文档（docs/adr/0035-wikilink-graph.md）。
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import re
 import sys
 import threading
@@ -42,11 +45,15 @@ from storage import AVAILABLE, DISK_OFFLINE, Availability, open_storage
 logger = logging.getLogger(__name__)
 
 # 缓存格式版本。改动 FileEntry 或缓存结构时递增，旧缓存随之作废。
-CACHE_FORMAT = 4  # 2：workspace 更名为 source；3：全文移出条目，改为 LRU 全文缓存；
+CACHE_FORMAT = 5  # 2：workspace 更名为 source；3：全文移出条目，改为 LRU 全文缓存；
                   # 4：条目增 agent_editor（编辑者主体登记，ADR-0031；不兼容 3，升 0.5.0 全量重建一次）
+                  # 5：条目增 links（[[链接]] 目标，ADR-0035；不兼容 4，升 0.7.0 全量重建一次）
 
 # 同一文档在单次检索结果中最多占的位置数。
 MAX_CHUNKS_PER_DOC = 2
+
+# search 每条命中附带的关联文档篇数上限（ADR-0035）。
+MAX_RELATED = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +78,8 @@ class FileEntry:
 
     agent_mtime：该文件经 myMemory save 写入后的落盘 mtime；与当前 mtime 相等即
     写后未被动过。agent_editor：那次写入的路由身份（用户名/管理员名/guest；
-    单机写入为 None）。二者决定 editor 属性（docs/adr/0018、0031）：
+    单机写入为 None）。links：正文里 [[链接]] 的目标（去掉别名与锚点，未解析，
+    ADR-0035）。二者决定 editor 属性（docs/adr/0018、0031）：
     mtime 失配 → scan（扫描发现改动；可能是人改的，也可能是别的
     设备/程序改的，不做推断）；匹配且 agent_editor 为 None → agent；
     否则 → agent_editor。
@@ -87,6 +95,7 @@ class FileEntry:
     path_tokens: tuple[str, ...]              # source 名 + 路径的分词结果
     agent_mtime: float | None = None
     agent_editor: str | None = None
+    links: tuple[str, ...] = ()
 
     @property
     def key(self) -> DocKey:
@@ -215,6 +224,7 @@ class IndexSnapshot:
     __slots__ = (
         "entries", "availability", "bm25", "chunks", "documents", "contents", "cache",
         "storages", "indexed_paths", "built_at", "build_seconds", "signature", "scoring",
+        "_graph",
     )
 
     def __init__(
@@ -239,9 +249,12 @@ class IndexSnapshot:
         self.signature = _content_signature(entries)
         keys = sorted(entries)
 
+        # 关联图按需构建（link_graph 关闭时从不构建）；内容签名相同则链接相同，直接沿用。
+        self._graph: dict[DocKey, tuple[str, ...]] | None = None
         if reuse is not None and reuse.signature == self.signature:
             self.chunks = reuse.chunks
             self.bm25 = reuse.bm25
+            self._graph = reuse._graph
         else:
             self.chunks = [
                 Chunk(source=entry.source, path=entry.path, chunk_index=i,
@@ -377,6 +390,24 @@ class IndexSnapshot:
                 )
             )
         return len(ranked), hits
+
+    def related(self, source: str, path: str, limit: int = MAX_RELATED) -> list[str]:
+        """同一 source 内与该文档有 [[链接]] 关联（出链或反链）的文档路径，至多 limit 篇。
+
+        超过 limit 篇时伪随机抽取：种子取自文档版本与邻居集合，二者不变就一直返回同一组，
+        文档或其关联变了才重新抽（ADR-0035）。不跨 source，因此不会越出会话范围。
+        """
+        graph = self._graph
+        if graph is None:
+            graph = self._graph = build_link_graph(self.entries)
+        key = (source, path)
+        neighbors = graph.get(key, ())
+        entry = self.entries.get(key)
+        if len(neighbors) <= limit or entry is None:
+            return list(neighbors[:limit])
+        basis = "\0".join((source, path, repr(entry.version), *neighbors))
+        seed = int.from_bytes(hashlib.sha256(basis.encode()).digest()[:8], "big")
+        return sorted(random.Random(seed).sample(neighbors, limit))
 
     def _bonus_function(self, query: str, now: float):
         """返回 chunk → 加分的函数。同一文档只算一次（同一文档的所有 chunk 加同样的分）。"""
@@ -521,6 +552,77 @@ def mask_wikilinks(text: str) -> str:
     return _WIKILINK.sub(lambda m: " " * len(m.group()), text)
 
 
+def extract_links(text: str) -> tuple[str, ...]:
+    """正文里每个 [[目标|别名]] / [[目标#标题]] 的目标部分，去重保序。
+
+    与 strip_wikilinks 无关：遮罩只影响检索词，链接照样记下。
+    """
+    targets: dict[str, None] = {}
+    for match in _WIKILINK.finditer(text):
+        target = match.group()[2:-2].split("|", 1)[0].split("#", 1)[0]
+        target = target.replace("\\", "/").strip().strip("/").strip()
+        if target:
+            targets[target] = None
+    return tuple(targets)
+
+
+def _resolve_link(target: str, paths: dict[str, str], by_name: dict[str, list[str]],
+                  extensions: tuple[str, ...]) -> str | None:
+    """按 Obsidian 的习惯在同一 source 内解析：先精确路径，再按文件名/路径后缀匹配，
+    同名多篇取路径最短的（再按字典序）。大小写不敏感；扩展名可省略。
+
+    解析不到时逐段去掉开头的目录再试：Obsidian 仓库根可能在 source 目录之上，
+    链接写成 [[raw/分类/文件]] 而 source 目录就是 raw。
+    """
+    parts = target.split("/")
+    for i in range(len(parts)):
+        resolved = _resolve_exact(target if i == 0 else "/".join(parts[i:]),
+                                  paths, by_name, extensions)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _resolve_exact(target: str, paths: dict[str, str], by_name: dict[str, list[str]],
+                   extensions: tuple[str, ...]) -> str | None:
+    wanted = target.casefold()
+    candidates = [wanted] if wanted.endswith(extensions) else [wanted + ext for ext in extensions]
+    for cand in candidates:
+        if cand in paths:
+            return paths[cand]
+    matches = [p for cand in candidates
+               for p in by_name.get(cand.rsplit("/", 1)[-1], ())
+               if p.casefold().endswith("/" + cand)]
+    return min(matches, key=lambda p: (len(p), p)) if matches else None
+
+
+def build_link_graph(entries: Mapping[DocKey, FileEntry]) -> dict[DocKey, tuple[str, ...]]:
+    """[[链接]] 解析成同 source 内的无向邻接：文档 → 关联文档路径（排序）。
+
+    出链与反链都算关联；解析不到的链接、指向自己的链接丢弃；不跨 source（ADR-0035）。
+    """
+    by_source: dict[str, list[str]] = {}
+    for source, path in entries:
+        by_source.setdefault(source, []).append(path)
+    adjacency: dict[DocKey, set[str]] = {}
+    for source, source_paths in by_source.items():
+        paths = {p.casefold(): p for p in source_paths}
+        by_name: dict[str, list[str]] = {}
+        for p in source_paths:
+            by_name.setdefault(p.casefold().rsplit("/", 1)[-1], []).append(p)
+        extensions = tuple(sorted({PurePosixPath(p).suffix.casefold() for p in source_paths
+                                   if PurePosixPath(p).suffix},
+                                  key=lambda ext: (ext != ".md", ext)))
+        for path in source_paths:
+            for target in entries[(source, path)].links:
+                resolved = _resolve_link(target, paths, by_name, extensions)
+                if resolved is None or resolved == path:
+                    continue
+                adjacency.setdefault((source, path), set()).add(resolved)
+                adjacency.setdefault((source, resolved), set()).add(path)
+    return {key: tuple(sorted(neighbors)) for key, neighbors in adjacency.items()}
+
+
 def _source_scoring(config: Config, name: str) -> Scoring:
     for src in config.sources:
         if src.name == name:
@@ -550,6 +652,7 @@ def _make_entry(config: Config, source: str, path: str, mtime: float, size: int,
                                                                config.domain_terms)),
         agent_mtime=agent_mtime,
         agent_editor=agent_editor,
+        links=tuple(intern(link) for link in extract_links(content)),
     )
 
 

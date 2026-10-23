@@ -22,6 +22,7 @@ enter the index.
 - **Full-text search**: BM25 keyword matching + jieba tokenization — no vectors, no external services
 - **Tunable scoring** (`scoring`): recently modified and path-matching documents get a bonus, stale documents in similar topics get demoted
 - **Evidence, not answers**: retrieval returns raw snippets with provenance (source + path); conclusions are drawn by the AI itself
+- **Link graph**: documents are connected with Obsidian-style `[[wikilinks]]`; each search hit lists related documents in the same source (`link_graph`)
 - **Fast start**: the index has a persistent cache; startup serves from the cache first and verifies incrementally in the background
 - **Disk-outage resilient**: when a mounted volume temporarily goes offline, the index and cache stay intact and search/read keep working
 - **Constrained writable surface**: config distinguishes read-only / writable sources; AI can only write sources explicitly marked writable
@@ -259,6 +260,8 @@ data. Config changes **always require a restart to take effect**.
 | `max_cached_docs` | `1000` | Max full texts kept in memory (LRU); `0` unlimited |
 | `domain_terms` | `[]` | Domain term list, see below |
 | `allow_mcp_delete` | `false` | **AI deletion circuit breaker**: only when `true` is `delete` exposed to AI; when off, the tool does not appear in the tool list |
+| `link_graph` | `true` | **Link graph**: each `search` hit lists up to 3 documents in the same source connected to it by `[[wikilinks]]` (`related`, either direction; sampled stably, re-sampled only when the document or its links change), and the `save` description asks the AI to link related memories with `[[filename]]`. `false` removes both (restart required). See [ADR-0035](docs/adr/0035-wikilink-graph.md) |
+| `auto_save` | `false` | **Proactive saving**: adds a section to the server instructions that lets the AI save lessons, pitfalls and preferences without asking first (restart required); append `?auto_save=true/false` to the MCP URL to override per connection, see [ADR-0036](docs/adr/0036-auto-save-switch.md) |
 | `scoring` | see below | Score adjustments on top of BM25; sources can override per field |
 
 **source**: `name` + `dir` (+ optional `writable`, `description`, `type`, `scoring`).
@@ -333,6 +336,8 @@ python3 config.py source remove <name> [--yes] [--restart]
 python3 config.py config set poll_interval <seconds> [--restart]
 python3 config.py config set max_cached_docs <docs> [--restart]
 python3 config.py config set allow_mcp_delete <true|false> [--restart]   # AI deletion switch, default false
+python3 config.py config set link_graph <true|false> [--restart]         # link graph switch, default true
+python3 config.py config set auto_save <true|false> [--restart]          # proactive saving switch, default false
 python3 config.py config edit   --scoring <field>=<value> [--scoring …] [--reset-scoring <field>|all] [--restart]   # global scoring
 python3 config.py source edit   <name> --scoring <field>=<value> [--scoring …] [--reset-scoring <field>|all] [--restart]
 python3 config.py reindex [--full]        # Immediate incremental refresh (--full for full), no restart needed

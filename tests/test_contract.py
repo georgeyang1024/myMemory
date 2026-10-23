@@ -87,6 +87,19 @@ def test_instructions_state_the_hard_constraints(server):
     )
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_auto_save_section_follows_switch(tmp_path: Path, enabled: bool):
+    """「主动保存」一节只在 auto_save 开启时出现；默认关。"""
+    (tmp_path / "memory").mkdir()
+    assert make_config(tmp_path).auto_save is False, "默认必须关"
+    config = make_config(tmp_path, auto_save=enabled)
+    holder = IndexHolder(config)
+    holder.build_now()
+    text = create_server(config, holder).instructions
+    assert ("主动保存" in text) is enabled
+    assert "## 使用规则" in text and "{" not in text
+
+
 # --- 工具级 --------------------------------------------------------------
 
 def test_all_five_tools_exposed(tools):
@@ -444,3 +457,66 @@ def test_raw_text_survives_real_streamable_http_transport(tmp_path: Path):
     assert parse_get_document(doc_text)[1] == TEXT
     _, hits = parse_search(search_text)
     assert all(snippet == TEXT[m["char_start"]:m["char_end"]] for m, snippet in hits)
+
+
+@pytest.mark.parametrize(("system", "query", "expected"), [
+    (False, "", False), (True, "", True),
+    (False, "auto_save=true", True), (True, "auto_save=0", False),
+    (False, "auto_save=", False),
+])
+def test_auto_save_url_param_overrides_config(tmp_path: Path, system: bool, query: str,
+                                              expected: bool):
+    """?auto_save= 覆盖系统配置，只影响握手下发的 instructions（ADR-0036）。"""
+    import socket
+    import threading
+    import time
+
+    import urllib.error
+    import urllib.request
+
+    import uvicorn
+
+    from server import UserScopeMiddleware
+
+    (tmp_path / "memory").mkdir()
+    config = make_config(tmp_path, auto_save=system)
+    holder = IndexHolder(config)
+    holder.build_now()
+    app = UserScopeMiddleware(create_server(config, holder).streamable_http_app(
+        streamable_http_path="/mcp", transport_security=None, host="127.0.0.1"), config)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not srv.started and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "t", "version": "1"}}}
+    def post(suffix: str) -> tuple[int, str]:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/mcp{suffix}", json.dumps(init).encode(),
+            {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+
+    try:
+        status, text = post(f"?{query}" if query else "")
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=5)
+    assert status == 200
+    data_lines = [line[5:] for line in text.splitlines() if line.startswith("data:")]
+    body = json.loads(data_lines[0] if data_lines else text)
+    instructions = body["result"]["instructions"]
+    assert ("主动保存" in instructions) is expected
+    assert "## 使用规则" in instructions

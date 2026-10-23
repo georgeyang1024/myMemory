@@ -81,6 +81,8 @@ SETTABLE = {
 # 配置项 → (含义, 开启时的后果)：布尔开关，取值 true/false。
 SETTABLE_BOOLS = {
     "allow_mcp_delete": ("AI 能否删除记忆", "delete 工具对 AI 开放"),
+    "link_graph": ("关联图", "search 结果附 [[链接]] 关联文档"),
+    "auto_save": ("主动保存", "AI 不经询问直接保存经验、踩坑、偏好"),
 }
 # 打分调整（ADR-0027）：全局用 config edit --scoring，单个 source 用 source edit --scoring，写法相同。
 SCORING_FIELDS = tuple(DEFAULTS["scoring"])
@@ -650,7 +652,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     cfg = sub.add_parser("config", help="修改配置").add_subparsers(dest="action", required=True)
     p = cfg.add_parser("set", help="设置配置项：poll_interval（秒）、max_cached_docs（篇）、"
-                                   "allow_mcp_delete（true/false，AI 删除开关）")
+                                   "allow_mcp_delete（true/false，AI 删除开关）、"
+                                   "link_graph（true/false，关联图开关）、"
+                                   "auto_save（true/false，主动保存开关）")
     p.add_argument("key", choices=sorted(set(SETTABLE) | set(SETTABLE_BOOLS)))
     p.add_argument("value")
     p.add_argument("--restart", action="store_true", help="改完后重启服务")
