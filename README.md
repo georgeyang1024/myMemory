@@ -63,7 +63,8 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 ```text
 记忆目录（任选）：\\NAS\memories        —— 本地盘 / NAS / webDev 挂载，放哪都行
 设备 A（台式机）── mcp 端点 http://<主机>:7083/mcp 接入
-设备 B（笔记本）── 同一端点接入，同一份记忆；下面的对话发生在 B 上，不带任何本地上下文
+设备 B（笔记本）── 同一端点接入，同一份记忆；
+下面的对话发生在 B 上，不带任何本地上下文
 ```
 
 > **用户**：xxx 工程源码里，临时文件它是在哪儿清理的？
