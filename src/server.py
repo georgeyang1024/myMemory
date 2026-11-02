@@ -91,7 +91,8 @@ SERVER_INSTRUCTIONS = """\
 5. 返回的是原文片段，不是答案。结论自己写，并注明 source 和 path。
 
 ## 检索
-按 BM25 关键词字面匹配，不做同义改写。搜不到就换个词，
+BM25 关键词字面匹配，命中文档正文与头部 front matter 检索词（similar_terms 相似词及其它短键值）。
+搜不到就换个说法或用相似词（同义词、英文、缩写、简写）搜，
 或用 source 名、分类名、文件名、日期（26-08-04）、名词搜。\
 """
 
@@ -113,7 +114,8 @@ def server_instructions(config: Config, auto_save: bool | None = None) -> str:
 
 SEARCH_DESCRIPTION = """\
 按关键词检索记忆，返回原文片段及其 source / path。默认搜全部 source。
-按字面匹配，不认同义词：搜不到就换原文里可能出现的词。
+字面匹配：命中文档正文，也命中文档头部 front matter 里的 similar_terms 相似词
+（同义词、近似词、英文缩写、简写）与其它短键值。搜不到就换个词再搜。
 结果之间用首行给出的 boundary 行分隔。片段可能不完整，要全文或要修改时用 get-document。\
 """
 
@@ -134,10 +136,13 @@ has_more 为 true 时，把 next_offset 作为 offset 再读一次。\
 """
 
 SAVE_DESCRIPTION = """\
-新建或整篇覆盖一篇记忆，文件位置是 <source>/<category>/<filename>.md。
+新建或覆盖一篇记忆，文件位置是 <source>/<category>/<filename>.md。
 参数是 category + filename，没有 path 参数（例：category="工作", filename="周报"）。
 category 只有一级，不存在会自动创建，可为空。同名直接覆盖；改已有记忆的局部内容用 replace。
-索引异步刷新，刚写完几秒内 search / get-document 可能搜不到，不代表失败，不要重复 save。\
+similar_terms 必填：正文里没有、但将来可能被拿来搜这篇记忆的词（同义词、近似词、英文、缩写、简写），
+空格分隔，如 "replay nonce 重放攻击"。
+索引异步刷新，刚写完几秒内 search / get-document 可能搜不到，\
+不代表失败，不要重复 save。\
 """
 
 LIST_SOURCES_DESCRIPTION = """\
@@ -532,7 +537,7 @@ def render_get_document(payload: dict[str, Any]) -> str:
 
 
 def run_save(config: Config, holder: IndexHolder, source: str,
-             category: str, filename: str, content: str,
+             category: str, filename: str, content: str, similar_terms: str,
              editor: str | None = None) -> dict[str, Any]:
     """save 的纯逻辑部分。
 
@@ -546,7 +551,7 @@ def run_save(config: Config, holder: IndexHolder, source: str,
     "现在还搜不到" —— 否则它会把紧接着的一次 search 落空误判为写入失败。
     """
     try:
-        written = save_memory(config, source, category, filename, content)
+        written = save_memory(config, source, category, filename, content, similar_terms)
     except WriteError as exc:
         # 被动探测：可用性平时只在刷新时更新，两次刷新之间盘掉了，快照会说"可写"而写入失败。
         # 写失败时对这个 source 探一次，状态变了就立即更新快照并请求增量刷新——
@@ -570,6 +575,9 @@ def run_save(config: Config, holder: IndexHolder, source: str,
         "char_count": written.char_count,
         "created": written.created,
         "replaced_char_count": written.replaced_char_count,
+        "similar_terms": list(written.similar_terms),
+        "replaced_similar_terms": (None if written.replaced_similar_terms is None
+                                   else list(written.replaced_similar_terms)),
         "index_refresh": "started" if started else "merged",
     }
 
@@ -799,7 +807,7 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
     def tool_search(
         ctx: Context,
         query: Annotated[str, Field(description=(
-            "检索词。BM25 匹配，不做同义改写。专有名词命中最准："
+            "检索词。BM25 字面匹配，命中正文与头部相似词。专有名词命中最准："
             "source 名、分类名、文件名、日期（26-08-04）、长标识符。"
             "多个词以空格分隔，超过 500 字符会被截断。"
         ))],
@@ -857,8 +865,12 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
             "它和 source、category 一起决定覆盖谁——同名直接覆盖。"
         ))],
         content: Annotated[str, Field(description=(
-            "整篇 Markdown 正文，**整篇替换**目标文件，不是追加。"
-            "服务不加 frontmatter、标题或时间戳。"
+            "整篇 Markdown 正文，**整篇替换**目标文件的正文部分，不是追加。"
+        ))],
+        similar_terms: Annotated[str, Field(description=(
+            "必填、不能为空。正文里没有、但将来可能被拿来搜这篇记忆的词"
+            "（同义词、近似词、英文、缩写、简写），空格分隔，最多 20 个，"
+            "如 \"replay nonce 重放攻击\"。正文已有的词不用传，宁缺勿滥。"
         ))],
         category: Annotated[str, Field(description=(
             "一级分类目录名，如 工作、技术、生活。不能含 / —— 不支持嵌套目录。"
@@ -866,7 +878,8 @@ def create_server(config: Config, holder: IndexHolder) -> MCPServer:
         ))] = "",
     ) -> str:
         scoped, _allowed, editor = _session(ctx)
-        payload = run_save(scoped, holder, source, category, filename, content, editor)
+        payload = run_save(scoped, holder, source, category, filename, content,
+                           similar_terms, editor)
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     @server.tool(

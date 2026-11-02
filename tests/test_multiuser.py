@@ -570,7 +570,7 @@ def test_rest_guest_writable_end_to_end(http_env):
     # 但 scoped_config 的行为在 run 层与 REST 共用——写公共被现有只读路径拒绝。
     guest = scoped_config(config, None)
     with pytest.raises(Exception, match="只读"):
-        save_memory(guest, "memory", "", "访客尝试", "内容")
+        save_memory(guest, "memory", "", "访客尝试", "内容", "相似词")
 
 
 # --- 热发现 -------------------------------------------------------------------
@@ -659,7 +659,7 @@ def test_editor_single_machine(tmp_path: Path):
     config = make_config(tmp_path)
     holder = IndexHolder(config)
     holder.build_now()
-    run_save(config, holder, "memory", "", "单机", "内容")
+    run_save(config, holder, "memory", "", "单机", "内容", "相似词")
     _wait_idle(holder)
     entry = holder.snapshot.entries[("memory", "单机.md")]
     assert entry.agent_editor is None and entry.editor == "agent"
@@ -677,9 +677,9 @@ def test_editor_multi_user(tmp_path: Path):
     holder.build_now()
 
     # 张三写自己的 → 张三；李四（管理员）改 bob 的 → 李四；访客写公共 → guest
-    run_save(scoped_config(config, "张三"), holder, "张三", "", "甲", "内容", "张三")
-    run_save(scoped_config(config, "李四"), holder, "bob", "", "乙", "内容", "李四")
-    run_save(scoped_config(config, None), holder, "memory", "", "丙", "内容", "guest")
+    run_save(scoped_config(config, "张三"), holder, "张三", "", "甲", "内容", "相似词", "张三")
+    run_save(scoped_config(config, "李四"), holder, "bob", "", "乙", "内容", "相似词", "李四")
+    run_save(scoped_config(config, None), holder, "memory", "", "丙", "内容", "相似词", "guest")
     _wait_idle(holder)
     recent = run_recent(holder.effective_config(), holder.snapshot, 20)
     editors = {(r["source"], r["path"]): r["editor"] for r in recent["results"]}
@@ -694,7 +694,7 @@ def test_editor_scan_after_manual_touch(tmp_path: Path):
     config = make_multi_config(tmp_path)
     holder = IndexHolder(config)
     holder.build_now()
-    run_save(scoped_config(config, "alice"), holder, "alice", "", "乙", "内容", "alice")
+    run_save(scoped_config(config, "alice"), holder, "alice", "", "乙", "内容", "相似词", "alice")
     _wait_idle(holder)
     target = tmp_path / "users" / "alice" / "乙.md"
     later = target.stat().st_mtime + 10
@@ -710,14 +710,14 @@ def test_editor_cache_roundtrip(tmp_path: Path):
     config = make_multi_config(tmp_path)
     holder = IndexHolder(config)
     holder.build_now()
-    run_save(scoped_config(config, "alice"), holder, "alice", "", "丙", "内容", "alice")
+    run_save(scoped_config(config, "alice"), holder, "alice", "", "丙", "内容", "相似词", "alice")
     _wait_idle(holder)
     restarted = IndexHolder(config)
     restarted.start()
     _wait_idle(restarted)
     entry = restarted.snapshot.entries[("alice", "丙.md")]
     assert entry.agent_editor == "alice" and entry.editor == "alice", "agent_editor 跨重启保留"
-    assert CACHE_FORMAT == 5
+    assert CACHE_FORMAT == 10
 
 
 def test_editor_values_survive_cache_rescue(tmp_path: Path):
@@ -725,7 +725,7 @@ def test_editor_values_survive_cache_rescue(tmp_path: Path):
     config = make_multi_config(tmp_path)
     holder = IndexHolder(config)
     holder.build_now()
-    run_save(config, holder, "memory", "", "旧标记", "内容")
+    run_save(config, holder, "memory", "", "旧标记", "内容", "相似词")
     _wait_idle(holder)
     # 模拟旧格式缓存被抢救：条目带 agent_mtime、无 agent_editor
     rescued = FileEntry(source="memory", path="旧标记.md",

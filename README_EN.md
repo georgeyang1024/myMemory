@@ -19,7 +19,7 @@ enter the index.
 
 - **Multiple *sources***: personal, team, organization… each source is one directory, on local disk or a mounted volume
 - **NAS / webDev cross-device**: put the memory directory on a NAS or webDev mount, and multiple devices mounting the remote share share one memory
-- **Full-text search**: BM25 keyword matching + jieba tokenization — no vectors, no external services
+- **Full-text search**: BM25 keyword matching + jieba tokenization — no vectors, no external services; **similar terms** attached at write time cover synonyms
 - **Tunable scoring** (`scoring`): recently modified and path-matching documents get a bonus, stale documents in similar topics get demoted
 - **Evidence, not answers**: retrieval returns raw snippets with provenance (source + path); conclusions are drawn by the AI itself
 - **Link graph**: documents are connected with Obsidian-style `[[wikilinks]]`; each search hit lists related documents in the same source (`link_graph`)
@@ -117,9 +117,9 @@ look like `mcp__myMemory__save` (client concatenates server name + tool name).
 
 | Tool | One-line description |
 |---|---|
-| `search(query, limit=10, source="")` | BM25 full-text search across all sources by default; returns raw snippets². Source names, categories, file names, dates (`26-08-04`), and model-style identifiers all work directly as query terms |
+| `search(query, limit=10, source="")` | BM25 full-text search across all sources by default; returns raw snippets². Source names, categories, file names, dates (`26-08-04`), and model-style identifiers all work directly as query terms; also matches similar terms in the document head |
 | `get-document(source, path, offset=0, limit=40000)` | Read the raw document², character-level pagination; metadata includes `writable` and `stale` (content from cache while the disk is offline) |
-| `save(source, filename, content, category="")` | Write a memory to `<source>/<category>/<filename>.md`; **overwrites the whole file if it already exists** (irreversible, no backup); empty content rejected |
+| `save(source, filename, content, similar_terms, category="")` | Write a memory to `<source>/<category>/<filename>.md`; `similar_terms` is required: words not in the body but likely searched later, written into the file head; **overwrites the body if the file already exists** (irreversible, no backup; other head keys are kept); empty content rejected |
 | `rename(source, old_path, new_path)` | Rename/move a top-level category within the same source; the old file must exist, **rejects if the target exists**, never overwrites |
 | `replace(source, path, old_string, new_string)` | **Strictly literal** replace of old→new across the file (no regex, no case folding); replaces every occurrence and returns `replaced_count`; 0 hits or empty `new_string` rejected |
 | `list-sources()` | List all sources (`writable`/`available`/`doc_count`…), **does not return directory paths**; pick your write target from here |

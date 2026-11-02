@@ -6,6 +6,7 @@ import pytest
 
 import index
 from server import run_get_document, run_health, run_search
+from version import __version__
 
 from test_corpus import make_config
 
@@ -186,7 +187,7 @@ def test_health_carries_index_config_and_sources(env):
     body = run_health(config, snapshot)
 
     assert body["status"] == "ok"
-    assert body["version"] == "0.7.0"
+    assert body["version"] == __version__
     assert body["doc_count"] == snapshot.doc_count
     assert body["config_file"] == str(config.config_file)
     assert body["sources"] == [
@@ -287,7 +288,7 @@ def test_offline_source_is_stale_and_not_writable(multi, monkeypatch):
     assert team["available"] is False and team["unavailable_reason"] == DISK_OFFLINE
     assert team["writable"] is False and team["doc_count"] == 1
 
-    payload = run_save(multi, holder, "team", "", "新", "内容")
+    payload = run_save(multi, holder, "team", "", "新", "内容", "相似词")
     assert payload["saved"] is False and "team" not in payload["writable_sources"]
 
 
@@ -320,7 +321,7 @@ def test_recent_one_entry_per_file(multi):
 def test_recent_editor_agent_then_scan(multi):
     holder = index.IndexHolder(multi)
     holder.build_now()
-    run_save(multi, holder, "team", "技术", "规范", "agent 写的")
+    run_save(multi, holder, "team", "技术", "规范", "agent 写的", "相似词")
     _touch(multi.source("memory").dir / "扫描发现的.md", "扫描发现的", 1_600_000_000)
     holder.request_rebuild("测试")
     snapshot = _settle(holder)
@@ -344,7 +345,7 @@ def test_recent_editor_agent_then_scan(multi):
 def test_recent_agent_mark_survives_restart(multi):
     holder = index.IndexHolder(multi)
     holder.build_now()
-    run_save(multi, holder, "memory", "", "重启前", "内容")
+    run_save(multi, holder, "memory", "", "重启前", "内容", "相似词")
     _settle(holder)
 
     restarted = index.IndexHolder(multi)
@@ -378,7 +379,7 @@ def test_failed_save_passively_probes_and_updates_availability(multi, monkeypatc
                         lambda self: Availability(False, DISK_OFFLINE) if self.source.name == "team"
                         else storage.AVAILABLE)
     before = holder.snapshot
-    payload = run_save(multi, holder, "team", "", "新", "内容")
+    payload = run_save(multi, holder, "team", "", "新", "内容", "相似词")
 
     assert payload["saved"] is False and "掉线" in payload["error"]
     assert "team" not in payload["writable_sources"], "报错里的可写列表必须与失败原因一致"
