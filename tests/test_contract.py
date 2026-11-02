@@ -79,7 +79,10 @@ def test_instructions_frame_it_as_a_shared_human_ai_memory(server):
 def test_instructions_state_the_hard_constraints(server):
     """几条最容易让调用方翻车的性质必须写明。"""
     text = server.instructions
-    assert "不做同义改写" in text, "不说明这点，模型搜不到就会放弃或编造"
+    assert "字面匹配" in text and "similar_terms" in text, (
+        "BM25 字面匹配、靠 similar_terms 相似词兜底的检索习惯必须写明，"
+        "否则模型搜不到就会放弃或编造"
+    )
     assert "原文片段" in text and "不是答案" in text, "必须说明返回的是证据不是答案"
     assert "覆盖" in text, "覆盖语义必须写明，否则模型会以为同名写入是安全的"
     assert "先 `search`" in text or "先 search" in text, (
@@ -199,9 +202,11 @@ def test_save_takes_exactly_the_agreed_params(tools):
     "分类名 + 文件名是标识符"退化成"要做路径校验"。
     """
     schema = tools["save"].input_schema
-    assert set(schema["properties"]) == {"source", "category", "filename", "content"}
-    assert set(schema["required"]) == {"source", "filename", "content"}, \
-        "source 必填、无默认值；category 可为空"
+    assert set(schema["properties"]) == {"source", "category", "filename",
+                                         "content", "similar_terms"}
+    assert set(schema["required"]) == {"source", "filename", "content",
+                                       "similar_terms"}, \
+        "source 与 similar_terms 必填、无默认值；category 可为空"
 
 
 def test_get_document_requires_source(tools):

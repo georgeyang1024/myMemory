@@ -31,7 +31,7 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 
 - **多 source**：个人、团队、组织……每个 source 对应一个目录，可放本地盘或挂载盘
 - **NAS、webDev跨设备**：记忆目录放 NAS\webDev，多台设备挂载远端文档共用同一份记忆
-- **全文检索**：BM25 关键词匹配 + jieba 分词，无向量、无外部服务
+- **全文检索**：BM25 关键词匹配 + jieba 分词，无向量、无外部服务；写入时附**相似词**补同义召回
 - **打分可调**：近期修改、路径命中的文档加分，类似的文档旧文档降级（`scoring`）
 - **证据而非答案**：检索返回带来源（source + path）的原文片段，结论由 AI 自己写
 - **关联图**：文档间用 Obsidian 式 `[[链接]]` 关联，检索命中附带同 source 内的关联文档（`link_graph`）
@@ -45,6 +45,7 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 
 ## 目录
 
+- [使用效果](#使用效果)
 - [快速开始](#快速开始)
 - [MCP 工具](#mcp-工具)
 - [REST 端点](#rest-端点)
@@ -53,6 +54,91 @@ Use cases: personal AI note-taking, team knowledge bases that agents can query, 
 - [部署（Windows）](#部署windows)
 - [更新记录](#更新记录)
 - [License](#license)
+
+---
+
+
+## 使用效果
+
+```text
+记忆目录（任选）：\\NAS\memories        —— 本地盘 / NAS / webDev 挂载，放哪都行
+设备 A（台式机）── mcp 端点 http://<主机>:7083/mcp 接入
+设备 B（笔记本）── 同一端点接入，同一份记忆；下面的对话发生在 B 上，不带任何本地上下文
+```
+
+> **用户**：xxx 工程源码里，临时文件它是在哪儿清理的？
+
+```text
+search("xxx 工程源码 临时文件 清理")
+
+{"query": "xxx 工程源码 临时文件 清理", "total_matched": 8, "returned": 2,
+ "boundary": "========== myMemory-3f8c1d72be954a06 ==========", …}
+========== myMemory-3f8c1d72be954a06 ==========
+{"n": 1, "source": "memory", "path": "learn/xxx工程源码-模块地图.md",
+ "score": 20.8, "chunk_index": 4, "char_start": 3840, "char_end": 4160, …}
+　……boot 阶段 reap：unlink 上次中断残留，异常退出同样接得住……
+========== myMemory-3f8c1d72be954a06 ==========
+{"n": 2, "source": "memory", "path": "learn/xxx工程源码-工作目录契约.md",
+ "score": 16.9, "chunk_index": 2, "char_start": 1200, "char_end": 2000, …}
+　……reap(user_dir) 只动 user_dir 内条目，.ro/ 只读段一律不碰……
+========== myMemory-3f8c1d72be954a06 ==========
+```
+
+> **AI**：在 `src/boot/reap.c` 的 `sweep_leftovers()`——模块地图的记录里，启动
+> 时会 unlink 上次中断残留的产物，异常退出也接得住；清理范围有边界：`.ro/`
+> 只读段一律不碰（依据 `memory/learn/xxx工程源码-模块地图.md` 与
+> `…-工作目录契约.md`）。
+>
+> 你问的"临时文件""清理"，两篇笔记正文里一个字都没有——那边的原话是
+> "reap 残留产物"。能接上你这两个词，靠的是入库时附在文件头的
+> `similar_terms`（临时文件、清理、垃圾回收……），你的口语词直接命中了它们。
+
+> **用户**：那协议解析那块呢？感觉不止一个文件在干。
+
+```text
+search("协议解析 模块")
+
+{"query": "协议解析 模块", "total_matched": 5, "returned": 1,
+ "boundary": "========== myMemory-b92e7a45c0d81347 ==========", …}
+========== myMemory-b92e7a45c0d81347 ==========
+{"n": 1, "source": "memory", "path": "learn/xxx工程源码-模块地图.md",
+ "score": 19.6, "chunk_index": 4, "char_start": 4000, "char_end": 4320,
+ "related": ["learn/xxx工程源码-协议层笔记.md", "learn/xxx工程源码-工作目录契约.md"], …}
+　……packet_in：解析集中在 src/proto/……细节见 [[xxx工程源码-协议层笔记]]……
+========== myMemory-b92e7a45c0d81347 ==========
+```
+
+```text
+get-document("memory", "learn/xxx工程源码-协议层笔记.md")
+……src/proto/pkt.c：状态机 + 长度前缀，粘包在 feed() 里切；字段序号
+被 compat 注释钉住，先读再改；解析入口只有 packet_in 一处……（略）
+```
+
+> **AI**：集中在一处——`src/proto/pkt.c`：状态机 + 长度前缀，粘包在 `feed()`
+> 里切，解析入口只有 `packet_in` 一条。要动它先读 compat 注释，字段序号被
+> 那段注释钉住了。
+>
+> 补一句怎么找到的：搜回来的是模块地图那篇，返回时 `related` 里挂着协议
+> 层笔记——两篇之间用 `[[链接]]` 连着，顺着链接多读了这一篇，协议的
+> 细账不用你到源码里翻。
+
+> **用户**：对了，刚验证一个事——字段序号其实早就松绑了，2.3 起协议头带版本
+> 字段自协商，pkt.c 里那段 compat 注释是老的，先别按它来。
+
+```text
+save("memory", "xxx工程-字段序号2.3松绑.md", 正文…,
+     similar_terms=["兼容", "compat", "协议版本"], category="踩坑清单")
+
+{"saved": true, "source": "memory", "path": "踩坑清单/xxx工程-字段序号2.3松绑.md",
+ "char_count": 236, "created": true, "index_refresh": "started", …}
+```
+
+> **AI**：收到，这条跟协议层笔记里 compat 那段是冲突的，以你实测为准——2.3 起
+> 版本字段自协商，序号不用再钉死。已存到 `memory/踩坑清单/xxx工程-字段序号2.3松绑.md`，
+> 附的 `similar_terms`（兼容、compat、协议版本）保证下次有人按老注释搜"compat"
+> 改代码时，一定先撞见这条更正。索引正在后台刷新（`index_refresh: "started"`），
+> 几秒内下个会话就能搜到。旧笔记正文我没动——`save` 是覆盖式写入，老的 compat
+> 段先留着作对照，你要彻底清掉我就得读全文重写一篇了。
 
 ---
 
@@ -115,6 +201,7 @@ python3 run.py --logs         # 跟踪日志（Ctrl-C 只退出跟踪，不影�
 
 ---
 
+
 ## MCP 工具
 
 常驻 7 个 + `delete` 1 个（默认隐藏），客户端看到的全名形如 `mcp__myMemory__save`
@@ -122,9 +209,9 @@ python3 run.py --logs         # 跟踪日志（Ctrl-C 只退出跟踪，不影�
 
 | 工具 | 一句话说明 |
 |---|---|
-| `search(query, limit=10, source="")` | BM25 全文检索，默认跨全部 source，返回原文片段²；source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词 |
+| `search(query, limit=10, source="")` | BM25 全文检索，默认跨全部 source，返回原文片段²；source 名、分类、文件名、日期（`26-08-04`）、型号类标识符都可直接当检索词；也命中文档头部的相似词 |
 | `get-document(source, path, offset=0, limit=40000)` | 读取原文²，字符级分页；元数据带 `writable` 与 `stale`（掉盘时内容来自缓存） |
-| `save(source, filename, content, category="")` | 写一篇记忆到 `<source>/<category>/<filename>.md`；**已存在即整篇覆盖**（不可撤销、无备份），空正文拒绝 |
+| `save(source, filename, content, similar_terms, category="")` | 写一篇记忆到 `<source>/<category>/<filename>.md`；`similar_terms` 必填：正文里没有但可能被搜的词，写进文件头部；**已存在即覆盖正文**（不可撤销、无备份，旧头部其它键保留），空正文拒绝 |
 | `rename(source, old_path, new_path)` | 同 source 内改名/移动一级分类；旧文件必须存在，**目标存在即拒绝**，不覆盖 |
 | `replace(source, path, old_string, new_string)` | 全文**完全字面**替换 old→new（无正则/大小写折叠），命中几处换几处并返回 `replaced_count`；0 命中或空 new_string 拒绝 |
 | `list-sources()` | 列出全部 source（`writable`/`available`/`doc_count`…），**不返回目录路径**；写入目标从这里选 |
@@ -133,7 +220,6 @@ python3 run.py --logs         # 跟踪日志（Ctrl-C 只退出跟踪，不影�
 
 > ¹ `delete` 真删文件，受配置开关 `allow_mcp_delete`（默认 `false`，重启生效）
 > 控制：关闭时连工具都不会出现在 tools/list 里，LLM 看不到就不会调；开启需人工改配置。
-> `merge` 已在 0.5.0 移除（[ADR-0032](docs/adr/0032-remove-merge-tool.md)）。
 >
 > ² 原文不转义、可直接复制作 `replace` 的 `old_string`，格式见下（[ADR-0034](docs/adr/0034-raw-text-tool-output.md)）。
 

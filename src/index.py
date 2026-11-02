@@ -39,15 +39,22 @@ import jieba
 from rank_bm25 import BM25Okapi
 
 from config import Config, Scoring, effective_sources
-from corpus import Chunk, DocKey, DocMeta, split_text
+from corpus import (Chunk, DocKey, DocMeta, plan_front_matter, split_text)
 from storage import AVAILABLE, DISK_OFFLINE, Availability, open_storage
 
 logger = logging.getLogger(__name__)
 
 # 缓存格式版本。改动 FileEntry 或缓存结构时递增，旧缓存随之作废。
-CACHE_FORMAT = 5  # 2：workspace 更名为 source；3：全文移出条目，改为 LRU 全文缓存；
+CACHE_FORMAT = 10  # 2：workspace 更名为 source；3：全文移出条目，改为 LRU 全文缓存；
                   # 4：条目增 agent_editor（编辑者主体登记，ADR-0031；不兼容 3，升 0.5.0 全量重建一次）
                   # 5：条目增 links（[[链接]] 目标，ADR-0035；不兼容 4，升 0.7.0 全量重建一次）
+                  # 6：similar_tokens 中间形态（平文首行；未随版本发布）
+                  # 7：front matter 键遮罩中间形态（仅 similar_terms；未随版本发布）
+                  # 8：条目改 fm_tokens——头部全部短键值进同一检索词通道、总预算 512
+                  #    （ADR-0037 中间形态；未随版本发布）
+                  # 9：fm 预算 128、剔除布尔/纯数字、去引号、YAML 列表（未随版本发布）
+                  # 10：剔除值再加整值 http(s) URL
+                  #    （ADR-0037 定稿；不兼容 9，升 0.8.0 全量重建一次）
 
 # 同一文档在单次检索结果中最多占的位置数。
 MAX_CHUNKS_PER_DOC = 2
@@ -96,6 +103,10 @@ class FileEntry:
     agent_mtime: float | None = None
     agent_editor: str | None = None
     links: tuple[str, ...] = ()
+    fm_tokens: tuple[str, ...] = ()   # 头部 front matter 检索词的分词（ADR-0037）：
+    # similar_terms 词组 + 其它短键值（总预算 128 字符、短的优先、剔除布尔/纯数字/URL，见 corpus.plan_front_matter），
+    # 与 path_tokens 同一身份：进每个 chunk 的 BM25 语料，效果等同文件名。
+    # 头部无围栏块或没有选中任何键值时为空，行为与旧版一致。
 
     @property
     def key(self) -> DocKey:
@@ -264,7 +275,7 @@ class IndexSnapshot:
             ]
             if bm25 is None and self.chunks:
                 bm25 = BM25Okapi([
-                    list(entry.path_tokens) + list(tokens)
+                    list(entry.path_tokens) + list(entry.fm_tokens) + list(tokens)
                     for entry in (entries[k] for k in keys)
                     for tokens in entry.tokens
                 ])
@@ -630,15 +641,43 @@ def _source_scoring(config: Config, name: str) -> Scoring:
     return NO_SCORING
 
 
+def _mask_front_matter(content: str, plan) -> str:
+    """把规划选中的键行逐段替换为等长空格（ADR-0035 同手法，字符偏移不变）。
+
+    遮的是**整行**（键名+冒号+值）：值已作为词同胞的 fm_tokens 进每个 chunk；
+    不遮罩会让键行额外进 chunk 0 的正文分词——词频双计，键名（similar_terms、
+    tags 之类）与冒号本身还会成为词条噪音。无围栏块或没选中任何键行时原样返回。
+    """
+    if plan is None or not plan.mask_spans:
+        return content
+    parts: list[str] = []
+    prev = 0
+    for start, length in plan.mask_spans:
+        parts.append(content[prev:start])
+        parts.append(" " * length)
+        prev = start + length
+    parts.append(content[prev:])
+    return "".join(parts)
+
+
 def _make_entry(config: Config, source: str, path: str, mtime: float, size: int,
                 content: str, agent_mtime: float | None,
                 agent_editor: str | None = None) -> FileEntry:
     # 切块区间取自原文；检索词取自同一区间——开启 strip_wikilinks 时取自遮罩文本。
     pieces = split_text(content, size=config.chunk_size, step=config.chunk_step)
+    plan = plan_front_matter(content)
+    masked = _mask_front_matter(content, plan)
     if _source_scoring(config, source).strip_wikilinks:
-        masked = mask_wikilinks(content)
-        pieces = [(start, end, masked[start:end]) for start, end, _ in pieces]
+        masked = mask_wikilinks(masked)
+    pieces = [(start, end, masked[start:end]) for start, end, _ in pieces]
     intern = sys.intern  # 同一个词在十几万个块里反复出现，驻留后只占一份内存
+    # 头部 front matter 检索词（similar_terms 词组 + 其它短键值）：
+    # 进每个 chunk 的 BM25 语料，与 path_tokens 同构、效果等同文件名（ADR-0037）。
+    if plan is not None and plan.values:
+        fm_tokens = tuple(intern(tok) for tok
+                          in tokenize(" ".join(plan.values), config.domain_terms))
+    else:
+        fm_tokens = ()
     return FileEntry(
         source=source,
         path=path,
@@ -653,6 +692,7 @@ def _make_entry(config: Config, source: str, path: str, mtime: float, size: int,
         agent_mtime=agent_mtime,
         agent_editor=agent_editor,
         links=tuple(intern(link) for link in extract_links(content)),
+        fm_tokens=fm_tokens,
     )
 
 

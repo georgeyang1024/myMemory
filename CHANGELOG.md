@@ -10,6 +10,27 @@
 
 ---
 
+## [0.8.0] · 2026-10-31
+
+详见 [ADR-0037](docs/adr/0037-similar-terms.md)。
+
+### 新增
+
+- **相似词**：`save` 新增必填参数 `similar_terms`——正文里没有、但将来可能被拿来搜的词
+  （同义词、英文、缩写、简写），空格分隔，≤20 个词。写入文件头部 front matter
+  （`similar_terms: 词1 词2`），随文档进索引，人用编辑器改也生效
+- **头部检索词**：front matter 里的 `similar_terms`，以及其它短键值（title、tags……），
+  和文件名一样进每个 chunk 的索引；其它键值最多 128 字符，布尔、纯数字、URL 不收
+- save 覆盖已有文件时只换正文与相似词，旧头部的其它键保留；响应回显
+  `similar_terms` 与 `replaced_similar_terms`
+
+### 变更
+
+- `save` 必须传 `similar_terms`，不传或为空即报错
+- 索引缓存格式升到 10，升级后首次启动全量重建一次
+
+---
+
 ## [0.7.0] · 2026-10-16
 
 详见 [ADR-0035](docs/adr/0035-wikilink-graph.md)。

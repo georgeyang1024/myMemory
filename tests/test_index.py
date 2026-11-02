@@ -1199,3 +1199,142 @@ def test_default_scoring_keeps_explicit_history_query_on_target(stale_meeting_ro
     _, hits = build_index(stale_meeting_root).search("26-07-15 会议结论", 10, now=NOW)
     target = "会议/26-07-15-设备安全问题分析与解决方案-跨部门同步/会议结论.md"
     assert target in [h.path for h in hits[:2]]
+
+
+# --- 首行相似词（ADR-0037）：进词条、遮罩保偏移、可被检索 ------------------------
+
+@pytest.fixture
+def similar_root(tmp_path: Path) -> Path:
+    raw = tmp_path / "memory"
+    raw.mkdir(parents=True)
+    # 正文不含"重放"，语义只在头部 similar_terms 相似词上
+    (raw / "有词.md").write_text(
+        "---\nsimilar_terms: 重放 攻击 ReplayAttack\n---\n\n"
+        + "SecProto 机制本身的说明。" * 20, encoding="utf-8")
+    # 无相似词行的旧文档：行为不变
+    (raw / "无词.md").write_text("SecProto 机制本身的说明。" * 20, encoding="utf-8")
+    return tmp_path
+
+
+def test_entry_carries_fm_tokens(similar_root: Path):
+    snapshot = build_index(similar_root)
+    assert snapshot.entries[("memory", "有词.md")].fm_tokens != ()
+    assert snapshot.entries[("memory", "无词.md")].fm_tokens == ()
+
+
+def test_similar_terms_make_doc_findable(similar_root: Path):
+    snapshot = build_index(similar_root)
+    _, hits = snapshot.search("重放 攻击", 5)
+    assert {h.path for h in hits} == {"有词.md"}, "正文没有该词，命中的唯一来源是相似词"
+    assert [h.path for h in hits].count("有词.md") <= index.MAX_CHUNKS_PER_DOC
+
+
+def test_similar_terms_marker_words_do_not_enter_index(similar_root: Path):
+    """遮罩后 similar_terms 与冒号本身不是词条——搜标记词不命中任何文档。"""
+    snapshot = build_index(similar_root)
+    assert snapshot.search("similar_terms", 5) == (0, [])
+    assert snapshot.search("terms", 5) == (0, [])
+
+
+def test_similar_terms_masking_keeps_offsets(similar_root: Path):
+    """键行遮罩等长替换：chunk 偏移照旧对回原文，片段仍是正文原文。"""
+    snapshot = build_index(similar_root)
+    _, hits = snapshot.search("SecProto 机制", 10)
+    hits = [h for h in hits if h.path == "有词.md"]
+    assert hits
+    for hit in hits:
+        content = snapshot.contents[(hit.source, hit.path)]
+        assert content[hit.char_start:hit.char_end] == hit.text
+
+
+def test_similar_terms_masked_from_body_tokens(tmp_path: Path):
+    """键行不与相似词 tokens 双计：mask 后 chunk 语料不含键行的词。"""
+    raw = tmp_path / "memory"
+    raw.mkdir()
+    body = "---\nsimilar_terms: 阿尔法\n---\n\n" + "SecProto 机制。" * 200
+    (raw / "文本.md").write_text(body, encoding="utf-8")
+    snapshot = build_index(tmp_path)
+    entry = snapshot.entries[("memory", "文本.md")]
+    all_tokens = {tok for chunk in entry.tokens for tok in chunk}
+    assert not ({"similar", "terms", "阿尔法"} & all_tokens), (
+        "相似词只经 fm_tokens 进索引：键行被遮罩，正文分词里不得重复出现"
+    )
+
+
+def test_front_matter_other_keys_join_channel(tmp_path: Path):
+    """其它短键值与 similar_terms 同一通道：长文档任意 chunk 位置都搜得到。"""
+    raw = tmp_path / "memory"
+    raw.mkdir()
+    body = ("---\nsimilar_terms: 阿尔法\ntitle: 量子羊驼饲养指南\n"
+            "tags: 萌宠 毛绒\n---\n\n") + "SecProto 机制本身的说明。" * 200
+    (raw / "文本.md").write_text(body, encoding="utf-8")
+    snapshot = build_index(tmp_path)
+    entry = snapshot.entries[("memory", "文本.md")]
+    # 值进了通道；键名与冒号没进任何 chunk 语料
+    assert entry.fm_tokens != ()
+    assert "萌宠" in entry.fm_tokens
+    _, hits = snapshot.search("量子羊驼", 5)
+    assert "文本.md" in {h.path for h in hits}
+    assert any(h.chunk_index > 0 for h in hits if h.path == "文本.md"), (
+        "标题词在正文之外的 chunk 也命中——'每个块都带'通道生效"
+    )
+    _, hits = snapshot.search("萌宠", 5)
+    assert "文本.md" in {h.path for h in hits}
+
+
+def test_front_matter_budget_overflow_keeps_long_value_in_body(tmp_path: Path):
+    """总预算 128：装不下的键值整行留正文——只在 chunk 0 可检索，且不进通道。"""
+    raw = tmp_path / "memory"
+    raw.mkdir()
+    a = "甲词用尽" * 15   # 60 字符：短的先装，进通道
+    b = "乙词兜底" * 20   # 80 字符：60+80=140 > 128，留正文
+    body = f"---\ntags: {a}\ncategory: {b}\n---\n\n" + "SecProto 机制。" * 200
+    (raw / "文本.md").write_text(body, encoding="utf-8")
+    snapshot = build_index(tmp_path)
+    _, far_hits = snapshot.search("乙词兜底", 10)
+    far = [h for h in far_hits if h.path == "文本.md"]
+    assert far and all(h.chunk_index == 0 for h in far), "超预算：只算 chunk 0 的正文"
+    _, near_hits = snapshot.search("甲词用尽", 10)
+    assert any(h.chunk_index > 0 for h in near_hits if h.path == "文本.md"), "预算内：整篇可搜"
+
+
+def test_front_matter_junk_values_are_not_searchable(tmp_path: Path):
+    """布尔、纯数字与 URL 既不进通道，也不留在 chunk 0 正文。"""
+    raw = tmp_path / "memory"
+    raw.mkdir()
+    body = ("---\ntitle: 量子羊驼\nimport_body: false\ncreate_time: \"1738978466000\"\n"
+            "doc_url: \"https://alidocs.dingtalk.com/i/nodes/abc\"\n"
+            "tags:\n  - 萌宠\n  - 7\n---\n\n") + "SecProto 机制本身的说明。" * 200
+    (raw / "文本.md").write_text(body, encoding="utf-8")
+    snapshot = build_index(tmp_path)
+    entry = snapshot.entries[("memory", "文本.md")]
+    assert "萌宠" in entry.fm_tokens
+    all_tokens = set(entry.fm_tokens) | {tok for chunk in entry.tokens for tok in chunk}
+    assert not ({"false", "1738978466000", "7", "alidocs", "dingtalk"} & all_tokens)
+    _, hits = snapshot.search("萌宠", 5)
+    assert any(h.chunk_index > 0 for h in hits if h.path == "文本.md"), "列表值进通道：每个 chunk 都带"
+
+
+def test_front_matter_key_names_never_enter_index(tmp_path: Path):
+    """键名（similar_terms/tags/keywords…）与冒号不再是词条：搜不出任何文档。"""
+    raw = tmp_path / "memory"
+    raw.mkdir()
+    body = ("---\ntitle: 占位标题\nkeywords: 占位词\ntags: 占位标签\n"
+            "similar_terms: 阿尔法\n---\n\n") + "SecProto 机制本身的说明。" * 20
+    (raw / "文本.md").write_text(body, encoding="utf-8")
+    snapshot = build_index(tmp_path)
+    for marker in ("similar_terms", "tags", "keywords", "title"):
+        assert snapshot.search(marker, 5) == (0, []), marker
+
+
+def test_fm_tokens_survive_cache_roundtrip(similar_root: Path):
+    config = make_config(similar_root)
+    index.save_cache(config, index.build(config))
+    payload, is_fresh = index.read_cache(config)
+    assert is_fresh is True
+    entry = next(e for e in payload["entries"]
+                 if e.source == "memory" and e.path == "有词.md")
+    assert entry.fm_tokens != ()
+    snapshot = index.load_cache(config)
+    _, hits = snapshot.search("重放 攻击", 5)
+    assert [h.path for h in hits] == ["有词.md"]

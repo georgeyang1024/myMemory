@@ -35,11 +35,56 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config import Config, Source
+from corpus import assemble_similar_terms_header, merge_front_matter, parse_similar_terms_block
 from storage import DISK_OFFLINE, open_storage
 
 logger = logging.getLogger(__name__)
 
 EXTENSION = ".md"
+
+# 相似词（ADR-0037）的写入端约束：与 filename 同级的必填参数。
+MAX_SIMILAR_TERMS = 20
+MAX_SIMILAR_TERM_CHARS = 64
+
+
+def _validate_similar_terms(config: Config, raw: str) -> tuple[str, ...]:
+    """similar_terms 入参校验：空格分隔的相似词，不改词形原样保留。
+
+    每个词沿用 filename 的字符白名单（禁 / \\ : * ? " < > | 与 .. 等），
+    防止相似词行破坏 front matter 的"块内平文本键"格式约定。
+    """
+    seen: set[str] = set()
+    terms: list[str] = []
+    for word in (raw or "").split():
+        fold = word.casefold()
+        if fold not in seen:
+            seen.add(fold)
+            terms.append(word)
+    if not terms:
+        raise WriteError(
+            "similar_terms 不能为空。请附带这篇记忆的相似词：正文里没有、"
+            "但将来可能被拿来搜它的词形（同义词、近似词、英文、缩写、简写），"
+            "空格分隔，如 \"replay nonce 重放攻击\"。"
+        )
+    if len(terms) > MAX_SIMILAR_TERMS:
+        raise WriteError(
+            f"similar_terms 词数超上限 {MAX_SIMILAR_TERMS}（当前 {len(terms)}）："
+            "挑真正可能被搜的词，宁缺勿滥——正文已有的词本来搜得到。"
+        )
+    for term in terms:
+        if len(term) > MAX_SIMILAR_TERM_CHARS:
+            raise WriteError(
+                f"similar_terms 里 {term[:40]}… 超过每词 {MAX_SIMILAR_TERM_CHARS} 字符。"
+            )
+        if any(ord(ch) < 0x20 or ch == "\x7f" for ch in term):
+            raise WriteError(f"similar_terms 里 {term!r} 含控制字符，不是合法检索词。")
+        if not config.is_valid_filename(term):
+            raise WriteError(
+                f"similar_terms 里 {term!r} 不是合法检索词。"
+                "只允许中英文、数字、空格、常用标点与 ()[]{}.,&#+@!'=~% ，"
+                "不能以 . 或空格开头结尾、不能含 .. 或 / \\ : * ? \" < > |。"
+            )
+    return tuple(terms)
 
 
 class WriteError(ValueError):
@@ -57,6 +102,9 @@ class Written:
     mtime: float                         # 落盘后的 mtime，用于判定 editor（ADR-0031）
     created: bool                        # True=新建，False=覆盖了已有文件
     replaced_char_count: int | None      # 覆盖时为被替换内容的长度，新建时为 None
+    similar_terms: tuple[str, ...] = ()   # 本次写入的首行相似词（ADR-0037）
+    replaced_similar_terms: tuple[str, ...] | None = None
+    # 覆盖前旧文档的首行相似词；() = 旧文档没有相似词行；None = 新建或读不到旧文。
 
 
 def _normalize_stem(filename: str) -> str:
@@ -120,10 +168,13 @@ def _validate_filename(config: Config, stem: str, which: str = "filename") -> No
 
 
 def save_memory(config: Config, source: str, category: str, filename: str,
-                content: str) -> Written:
+                content: str, similar_terms: str) -> Written:
     """把一条记忆写到 <source目录>/[<category>/]<filename>.md，已存在即整篇覆盖。
 
-    source 必须已配置且可写；category 可为空（写到 source 根目录）。
+    source 必须已配置且可写；category 可为空（写到 source 根目录）
+    similar_terms 必填（ADR-0037）：空格分隔的相似词（同义词、近似词、英文、缩写、
+    简写），写进文件头部 front matter（skill metadata 形态的 `---` 围栏块），
+    块内已有其它键时只动 similar_terms 这一行，随文档一起进检索索引。
     category 与 filename 均为标识符而非路径，校验不通过即抛 WriteError。
     """
     name = (source or "").strip()
@@ -138,15 +189,22 @@ def save_memory(config: Config, source: str, category: str, filename: str,
         raise WriteError("filename 不能为空。传文件名即可，.md 后缀可带可不带。")
     _validate_category(config, category)
     _validate_filename(config, stem)
+    terms = _validate_similar_terms(config, similar_terms)
 
-    if not (content or "").strip():
+    # 相似词键由参数行唯一生成（assemble 内做原位替换/补键）；
+    # 正文 = content 去掉 BOM 与头部围栏块，供空内容与长度校验。
+    raw = content[1:] if content.startswith("\ufeff") else (content or "")
+    parsed = parse_similar_terms_block(raw)
+    body = raw[parsed.block_len:] if parsed is not None else raw
+
+    if not body.strip():
         raise WriteError(
             "content 不能为空。请传入这条记忆的 Markdown 正文。"
             "（空内容会覆盖掉已有记忆，因此这里一律拒绝。）"
         )
-    if len(content) > config.max_create_chars:
+    if len(body) > config.max_create_chars:
         raise WriteError(
-            f"content 过长：{len(content)} 字符，上限 {config.max_create_chars}。"
+            f"content 过长：{len(body)} 字符，上限 {config.max_create_chars}。"
             f"请拆成多条记忆，或精简内容。"
         )
 
@@ -157,15 +215,25 @@ def save_memory(config: Config, source: str, category: str, filename: str,
     # 一篇 3000 字的记忆"这件事出现在响应里——否则调用方无从察觉自己刚刚
     # 替换了什么。读失败不阻断写入：拿不到长度只是少一条提示。
     replaced_char_count: int | None = None
+    replaced_similar_terms: tuple[str, ...] | None = None
     created = storage.stat(relative) is None
     if not created:
         try:
-            replaced_char_count = len(storage.read_text(relative))
+            old = storage.read_text(relative)
+            # () = 覆盖前旧文档头部没有相似词键（人建的或 0.8.0 写过首行平文本但未迁移的）。
+            replaced_char_count = len(old)
+            parsed_old = parse_similar_terms_block(old)
+            replaced_similar_terms = parsed_old.terms if parsed_old is not None else ()
+            # 只换正文与 similar_terms：旧头部其它键保留，content 自带头部时按键合并
+            raw = merge_front_matter(old, raw)
         except OSError as exc:
             logger.warning("覆盖前读取旧内容失败 %s/%s: %s", name, relative, exc)
 
+    # 头部围栏块由参数词表装配：已有键原位替换、块内其它键不动、无块新建
+    # （格式约定见 ADR-0037；正文取自装配后的完整文本）。
+    text = assemble_similar_terms_header(terms, raw)
     # 结尾补一个换行：Markdown 文件不以换行结尾在各类工具里都是噪音来源。
-    text = content if content.endswith("\n") else content + "\n"
+    text = text if text.endswith("\n") else text + "\n"
     try:
         stat = storage.write_text(relative, text)
     except OSError as exc:
@@ -186,6 +254,8 @@ def save_memory(config: Config, source: str, category: str, filename: str,
         mtime=stat.mtime,
         created=created,
         replaced_char_count=replaced_char_count,
+        similar_terms=terms,
+        replaced_similar_terms=replaced_similar_terms,
     )
 
 
